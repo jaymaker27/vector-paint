@@ -49,3 +49,6 @@ def command(cmd: Command):
         raise HTTPException(status_code=400, detail=f"Unknown action: {cmd.action}")
 
     return {"status": "ok", "received": cmd.model_dump()}
+
+from fastapi.staticfiles import StaticFiles
+app.mount("/", StaticFiles(directory="/home/jdiamond/vector-paint/ui_frontend", html=True), name="ui")

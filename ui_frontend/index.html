@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Vector Projectile Painting</title>
+<style>
+  :root { --bg:#0b0f12; --panel:#111722; --accent:#00ffff; --text:#e6f0ff; --muted:#93a4b7; }
+  html,body { height:100%; margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial; }
+  .wrap { min-height:100%; display:grid; place-items:center; padding:24px; }
+  .card { width:min(720px,90vw); background:var(--panel); border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.35); padding:28px; }
+  h1 { margin:0 0 6px 0; letter-spacing:.5px; }
+  p.sub { margin:0 0 18px 0; color:var(--muted); }
+  .row { display:flex; flex-wrap:wrap; gap:12px; margin-top:16px; }
+  button { flex:1 1 200px; border:none; border-radius:12px; padding:16px; font-size:16px; font-weight:600; cursor:pointer; background:#0e2233; color:var(--accent); outline:1px solid rgba(0,255,255,.25); transition:transform .05s ease, outline-color .2s ease; }
+  button:hover { transform:translateY(-1px); outline-color:var(--accent); }
+  .log { margin-top:18px; background:#0a121b; border-radius:10px; padding:12px; height:170px; overflow:auto; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:13px; color:#bfe7ff; }
+  .footer { margin-top:10px; font-size:12px; color:var(--muted); }
+  .ok { color:#8aff9c; } .err { color:#ff7d7d; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Vector Projectile Painting</h1>
+      <p class="sub">Main Menu • Pi UI</p>
+      <div class="row">
+        <button id="calibrate">Calibrate</button>
+        <button id="testfire">Test Fire</button>
+        <button id="paint">Paint (stub)</button>
+      </div>
+      <div class="log" id="log"></div>
+      <div class="footer">Backend: <code>/command</code> on port 8080 • Status: <span id="status">checking…</span></div>
+    </div>
+  </div>
+<script>
+const logEl = document.getElementById("log");
+const statusEl = document.getElementById("status");
+const api = (action, params) =>
+  fetch("/command", {method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({action, params})})
+  .then(r => r.json());
+
+function log(msg, cls="") {
+  const t = new Date().toLocaleTimeString();
+  logEl.innerHTML += `<div class="${cls}">[${t}] ${msg}</div>`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+async function ping() {
+  try {
+    const r = await fetch("/health"); 
+    if (r.ok) { statusEl.textContent = "online"; statusEl.className="ok"; }
+    else { statusEl.textContent = "error"; statusEl.className="err"; }
+  } catch(e) { statusEl.textContent = "offline"; statusEl.className="err"; }
+}
+ping();
+
+document.getElementById("calibrate").onclick = async () => {
+  log("Calibrate requested…");
+  try { const res = await api("calibrate"); log("Calibrate: "+JSON.stringify(res), "ok"); }
+  catch(e){ log("Calibrate failed: "+e, "err"); }
+};
+
+document.getElementById("testfire").onclick = async () => {
+  log("Testfire requested…");
+  try { const res = await api("testfire"); log("Testfire: "+JSON.stringify(res), "ok"); }
+  catch(e){ log("Testfire failed: "+e, "err"); }
+};
+
+document.getElementById("paint").onclick = async () => {
+  log("Paint (stub) requested…");
+  try { const res = await api("paint", { file: "/tmp/example.png" }); log("Paint: "+JSON.stringify(res), "ok"); }
+  catch(e){ log("Paint failed: "+e, "err"); }
+};
+</script>
+</body>
+</html>
