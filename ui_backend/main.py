@@ -51,4 +51,4 @@ def command(cmd: Command):
     return {"status": "ok", "received": cmd.model_dump()}
 
 from fastapi.staticfiles import StaticFiles
-app.mount("/", StaticFiles(directory="/home/jdiamond/vector-paint/ui_frontend", html=True), name="ui")
+app.mount("/", StaticFiles(directory="/home/jdiamond/lmtcpgmd/ui_frontend", html=True), name="ui")
