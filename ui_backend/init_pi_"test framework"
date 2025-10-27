@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""
+turret_graph_and_fire.py
+
+Graph-to-motion with optional firing.
+SAFE_MODE = True  => no trigger pulses, only logs (use this for testing)
+SAFE_MODE = False => trigger pulses will activate TRIGGER_PIN
+
+*** DO NOT run with SAFE_MODE=False until you have completed all hardware safety checks. ***
+"""
+import time, csv, threading, sys
+from pathlib import Path
+
+# Try pigpio first for reliable pulses; fall back to RPi.GPIO
+try:
+    import pigpio
+    PIGPIO = True
+    pi = pigpio.pi()
+    if not pi.connected:
+        raise RuntimeError("pigpio not running")
+except Exception:
+    PIGPIO = False
+    import RPi.GPIO as GPIO
+
+# ----------------- CONFIG -----------------
+# GPIO pins (BCM) — change to match your wiring
+STEP_X = 17
+DIR_X  = 27
+EN_X   = 22
+
+STEP_Y = 23
+DIR_Y  = 24
+EN_Y   = 25
+
+TRIGGER_PIN = 26     # output to fire trigger (relay/MOSFET that shorts trigger switch)
+KILL_PIN = 16        # emergency hardware push button (active LOW)
+MODE_PIN = 12        # mode switch (graphing/tracking) optional
+LIMIT_X_HOME = 5
+LIMIT_X_MAX  = 6
+LIMIT_Y_HOME = 13
+LIMIT_Y_MAX  = 19
+
+# Motor parameters (adjust to your driver settings)
+FULL_STEPS = 200           # motor full-steps per rev (typical 1.8° motor)
+MICROSTEP = 16             # set the DM556D microstep switches to this value
+STEPS_PER_REV = FULL_STEPS * MICROSTEP
+
+# step pulse timing
+STEP_DELAY = 0.001         # seconds (adjust for safe slow speed during tests)
+
+# firing parameters
+FIRE_PULSE_SECONDS = 0.1   # how long trigger is activated for each point (adjust to safe timing)
+
+# Safety flag: True = DRY RUN (no actual trigger), False = will pulse trigger
+SAFE_MODE = True
+
+# ------------------------------------------
+
+# State & calibration containers
+class Cal:
+    def __init__(self):
+        self.home = 0
+        self.max_step = None
+        self.steps_range = None
+cal_x = Cal()
+cal_y = Cal()
+
+current_x = 0
+current_y = 0
+
+stop_event = threading.Event()
+move_lock = threading.Lock()
+
+# ----------------- GPIO init -----------------
+if PIGPIO:
+    def out_setup(pin): pi.set_mode(pin, pigpio.OUTPUT)
+    def in_setup(pin): pi.set_mode(pin, pigpio.INPUT); pi.set_pull_up_down(pin, pigpio.PUD_UP)
+    def write(pin, val): pi.write(pin, 1 if val else 0)
+    def read(pin): return pi.read(pin)
+else:
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    def out_setup(pin): GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+    def in_setup(pin): GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    def write(pin, val): GPIO.output(pin, GPIO.HIGH if val else GPIO.LOW)
+    def read(pin): return GPIO.input(pin)
+
+# outputs
+for p in [STEP_X, DIR_X, EN_X, STEP_Y, DIR_Y, EN_Y, TRIGGER_PIN]:
+    out_setup(p)
+# inputs
+for p in [KILL_PIN, MODE_PIN, LIMIT_X_HOME, LIMIT_X_MAX, LIMIT_Y_HOME, LIMIT_Y_MAX]:
+    in_setup(p)
+
+# default: disable drivers (assume enable active low)
+write(EN_X, 1)
+write(EN_Y, 1)
+
+def emergency_pressed():
+    # active LOW
+    return read(KILL_PIN) == 0
+
+# ----------------- stepping helpers -----------------
+def pulse_step_pin(pin, delay):
+    """Single step pulse; uses pigpio or GPIO."""
+    if PIGPIO:
+        pi.write(pin, 1)
+        time.sleep(delay/2)
+        pi.write(pin, 0)
+        time.sleep(delay/2)
+    else:
+        write(pin, 1)
+        time.sleep(delay/2)
+        write(pin, 0)
+        time.sleep(delay/2)
+
+def stepdir_move(step_pin, dir_pin, enable_pin, steps, delay=STEP_DELAY, direction=1):
+    """Move absolute number of pulses (microsteps)"""
+    if steps <= 0:
+        return True
+    # enable (active low assumed)
+    write(enable_pin, 0)
+    write(dir_pin, 1 if direction > 0 else 0)
+    for i in range(abs(steps)):
+        if stop_event.is_set() or emergency_pressed():
+            write(enable_pin, 1)
+            return False
+        pulse_step_pin(step_pin, delay)
+    write(enable_pin, 1)
+    return True
+
+# ----------------- homing/calibration -----------------
+def pressed(pin):
+    # limit switches assumed active LOW (pressed => 0)
+    return read(pin) == 0
+
+def home_axis(step_pin, dir_pin, en_pin, home_pin, max_pin, search_dir=1, delay=0.002):
+    """Homing routine returns (home_step=0, max_step) or (None, None) on abort."""
+    # enable driver
+    write(en_pin, 0)
+    # ensure we start away from home: if already pressed, back off
+    if pressed(home_pin):
+        stepdir_move(step_pin, dir_pin, en_pin, 200, delay=delay, direction=-search_dir)
+    # move toward home until pressed
+    steps = 0
+    while not pressed(home_pin):
+        if emergency_pressed() or stop_event.is_set():
+            write(en_pin, 1)
+            return None, None
+        stepdir_move(step_pin, dir_pin, en_pin, 1, delay=delay, direction=search_dir)
+        steps += 1
+    # define home = 0
+    # back off a little
+    stepdir_move(step_pin, dir_pin, en_pin, 50, delay=delay, direction=-search_dir)
+    time.sleep(0.05)
+    # find max
+    maxsteps = 0
+    while not pressed(max_pin):
+        if emergency_pressed() or stop_event.is_set():
+            write(en_pin, 1)
+            return None, None
+        stepdir_move(step_pin, dir_pin, en_pin, 1, delay=delay, direction=search_dir)
+        maxsteps += 1
+    write(en_pin, 1)
+    return 0, maxsteps
+
+def calibrate_all():
+    global cal_x, cal_y, current_x, current_y
+    with move_lock:
+        stop_event.clear()
+        hx, mx = home_axis(STEP_X, DIR_X, EN_X, LIMIT_X_HOME, LIMIT_X_MAX, search_dir=1)
+        if hx is None: return False
+        cal_x.home, cal_x.max_step = hx, mx
+        cal_x.steps_range = mx - hx if mx and mx>hx else None
+        current_x = cal_x.home
+        hy, my = home_axis(STEP_Y, DIR_Y, EN_Y, LIMIT_Y_HOME, LIMIT_Y_MAX, search_dir=1)
+        if hy is None: return False
+        cal_y.home, cal_y.max_step = hy, my
+        cal_y.steps_range = my - hy if my and my>hy else None
+        current_y = cal_y.home
+    return True
+
+# ----------------- mapping & motion -----------------
+def norm_to_step_x(x_norm):
+    if cal_x.steps_range is None: raise RuntimeError("X not calibrated")
+    x = max(0.0, min(1.0, float(x_norm)))
+    return int(cal_x.home + x * cal_x.steps_range)
+
+def norm_to_step_y(y_norm):
+    if cal_y.steps_range is None: raise RuntimeError("Y not calibrated")
+    y = max(0.0, min(1.0, float(y_norm)))
+    return int(cal_y.home + y * cal_y.steps_range)
+
+def move_to(x_norm, y_norm, step_delay=STEP_DELAY):
+    """Blocking move to normalized coords; moves X then Y."""
+    global current_x, current_y
+    tx = norm_to_step_x(x_norm); ty = norm_to_step_y(y_norm)
+    dx = tx - current_x
+    dy = ty - current_y
+    if dx != 0:
+        dirx = 1 if dx>0 else -1
+        ok = stepdir_move(STEP_X, DIR_X, EN_X, abs(dx), delay=step_delay, direction=dirx)
+        if not ok: return False
+        current_x = tx
+    if dy != 0:
+        diry = 1 if dy>0 else -1
+        ok = stepdir_move(STEP_Y, DIR_Y, EN_Y, abs(dy), delay=step_delay, direction=diry)
+        if not ok: return False
+        current_y = ty
+    return True
+
+# ----------------- CSV loader & runner -----------------
+def load_csv(path):
+    pts = []
+    with open(path, newline='') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row: continue
+            try:
+                x = float(row[0]); y = float(row[1])
+            except Exception:
+                continue
+            pts.append((x,y))
+    return pts
+
+def fire_once():
+    if SAFE_MODE:
+        print("[SAFE_MODE] would fire here")
+        return
+    # actual pulse:
+    write(TRIGGER_PIN, 1)
+    time.sleep(FIRE_PULSE_SECONDS)
+    write(TRIGGER_PIN, 0)
+
+def run_graph(points, delay_between=0.2, step_delay=STEP_DELAY):
+    stop_event.clear()
+    for (x,y) in points:
+        if stop_event.is_set() or emergency_pressed():
+            print("Stopped by stop_event or emergency")
+            break
+        print(f"Moving to {x:.3f},{y:.3f}")
+        ok = move_to(x,y, step_delay=step_delay)
+        if not ok:
+            print("Move aborted")
+            break
+        print("Reached point; firing (if enabled)")
+        fire_once()
+        time.sleep(delay_between)
+    print("Graph run complete")
+
+# ----------------- CLI test runner -----------------
+def interactive_test():
+    print("Turret Graph & Fire - Interactive Test")
+    print("1) Calibrate/homing")
+    print("2) Load CSV and dry run")
+    print("3) Load CSV and run (LIVE if SAFE_MODE=False)")
+    print("4) Exit")
+    while True:
+        c = input("Choose: ").strip()
+        if c=='1':
+            print("Calibrating (homing) - be ready to stop!")
+            ok = calibrate_all()
+            print("Calibration:", ok)
+        elif c=='2':
+            p = input("CSV path: ").strip()
+            pts = load_csv(p)
+            print("Loaded", len(pts), "points")
+            run_graph(pts, delay_between=0.1)
+        elif c=='3':
+            p = input("CSV path: ").strip()
+            pts = load_csv(p)
+            print("Loaded", len(pts), "points")
+            run_graph(pts, delay_between=0.1)
+        elif c=='4':
+            break
+        else:
+            print("Unknown")
+
+# ----------------- cleanup -----------------
+def cleanup_and_exit():
+    write(EN_X, 1); write(EN_Y, 1); write(TRIGGER_PIN, 0)
+    if PIGPIO:
+        pi.stop()
+    else:
+        GPIO.cleanup()
+    print("Cleaned up. Exiting.")
+    sys.exit(0)
+
+# ----------------- run if called -----------------
+if __name__ == "__main__":
+    try:
+        print("SAFE_MODE =", SAFE_MODE)
+        interactive_test()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cleanup_and_exit()
