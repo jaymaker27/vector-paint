@@ -1,8 +1,19 @@
-
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
 *.log
-.env
+
+# Virtual envs
+.venv/
+venv/
+
+# OS/editor junk
 .DS_Store
-media/
+*.swp
+.idea/
+.vscode/
+
+# Project misc
+.env
