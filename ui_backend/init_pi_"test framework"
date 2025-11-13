@@ -1,297 +1,730 @@
 #!/usr/bin/env python3
 """
-turret_graph_and_fire.py
+vpp_turret_control_with_ui.py
 
-Graph-to-motion with optional firing.
-SAFE_MODE = True  => no trigger pulses, only logs (use this for testing)
-SAFE_MODE = False => trigger pulses will activate TRIGGER_PIN
+Extended from original vpp_turret_control.py:
+- Adds Flask web UI for calibration, CSV runs, SAFE_MODE toggle, and JPEG upload.
+- Adds simple image -> normalized XY points extraction using OpenCV.
+- Adds camera snapshot endpoint for visual verification during calibration/firing.
+- Preserves all motion, homing, and safety logic from the original script.
 
-*** DO NOT run with SAFE_MODE=False until you have completed all hardware safety checks. ***
+USAGE:
+  1) Install Python packages: (on the Pi)
+       python3 -m pip install --user flask opencv-python-headless numpy pillow
+     (use opencv-python instead of headless if you need GUI windows on the Pi)
+  2) Run:
+       sudo pigpiod    # if using pigpio
+       python3 vpp_turret_control_with_ui.py
+  3) Open your browser to http://<pi-ip>:5000 to access the simple UI.
+
+SAFETY: SAFE_MODE default = True. Do NOT set SAFE_MODE False until hardware tested.
 """
-import time, csv, threading, sys
-from pathlib import Path
 
-# Try pigpio first for reliable pulses; fall back to RPi.GPIO
+import os
+import time
+import sys
+import csv
+import threading
+import io
+from pathlib import Path
+from math import copysign
+from datetime import datetime
+
+# --- image processing deps ---
+import numpy as np
+from PIL import Image
+import cv2
+
+# --- web UI ---
+from flask import Flask, request, send_file, redirect, url_for, render_template_string, jsonify
+
+# ---------------------------
+# START: original hardware control code (slightly refactored into functions)
+# ---------------------------
+
+# Try pigpio first
+PIGPIO = False
 try:
     import pigpio
-    PIGPIO = True
     pi = pigpio.pi()
-    if not pi.connected:
-        raise RuntimeError("pigpio not running")
+    if pi is not None and pi.connected:
+        PIGPIO = True
 except Exception:
     PIGPIO = False
+
+if not PIGPIO:
     import RPi.GPIO as GPIO
-
-# ----------------- CONFIG -----------------
-# GPIO pins (BCM) — change to match your wiring
-STEP_X = 17
-DIR_X  = 27
-EN_X   = 22
-
-STEP_Y = 23
-DIR_Y  = 24
-EN_Y   = 25
-
-TRIGGER_PIN = 26     # output to fire trigger (relay/MOSFET that shorts trigger switch)
-KILL_PIN = 16        # emergency hardware push button (active LOW)
-MODE_PIN = 12        # mode switch (graphing/tracking) optional
-LIMIT_X_HOME = 5
-LIMIT_X_MAX  = 6
-LIMIT_Y_HOME = 13
-LIMIT_Y_MAX  = 19
-
-# Motor parameters (adjust to your driver settings)
-FULL_STEPS = 200           # motor full-steps per rev (typical 1.8° motor)
-MICROSTEP = 16             # set the DM556D microstep switches to this value
-STEPS_PER_REV = FULL_STEPS * MICROSTEP
-
-# step pulse timing
-STEP_DELAY = 0.001         # seconds (adjust for safe slow speed during tests)
-
-# firing parameters
-FIRE_PULSE_SECONDS = 0.1   # how long trigger is activated for each point (adjust to safe timing)
-
-# Safety flag: True = DRY RUN (no actual trigger), False = will pulse trigger
-SAFE_MODE = True
-
-# ------------------------------------------
-
-# State & calibration containers
-class Cal:
-    def __init__(self):
-        self.home = 0
-        self.max_step = None
-        self.steps_range = None
-cal_x = Cal()
-cal_y = Cal()
-
-current_x = 0
-current_y = 0
-
-stop_event = threading.Event()
-move_lock = threading.Lock()
-
-# ----------------- GPIO init -----------------
-if PIGPIO:
-    def out_setup(pin): pi.set_mode(pin, pigpio.OUTPUT)
-    def in_setup(pin): pi.set_mode(pin, pigpio.INPUT); pi.set_pull_up_down(pin, pigpio.PUD_UP)
-    def write(pin, val): pi.write(pin, 1 if val else 0)
-    def read(pin): return pi.read(pin)
-else:
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
-    def out_setup(pin): GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
-    def in_setup(pin): GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    def write(pin, val): GPIO.output(pin, GPIO.HIGH if val else GPIO.LOW)
-    def read(pin): return GPIO.input(pin)
 
-# outputs
-for p in [STEP_X, DIR_X, EN_X, STEP_Y, DIR_Y, EN_Y, TRIGGER_PIN]:
-    out_setup(p)
-# inputs
-for p in [KILL_PIN, MODE_PIN, LIMIT_X_HOME, LIMIT_X_MAX, LIMIT_Y_HOME, LIMIT_Y_MAX]:
-    in_setup(p)
+# ----------------- CONFIG (same as original, you can tweak) -----------------
+STEP_X, DIR_X = 23, 24
+STEP_Y, DIR_Y = 20, 21
 
-# default: disable drivers (assume enable active low)
-write(EN_X, 1)
-write(EN_Y, 1)
+LIM_X_MIN = 17
+LIM_Y_MIN = 22
+LIM_X_MAX = None
+LIM_Y_MAX = None
 
-def emergency_pressed():
-    # active LOW
-    return read(KILL_PIN) == 0
+ESTOP = 25
+FIRE  = 18
 
-# ----------------- stepping helpers -----------------
-def pulse_step_pin(pin, delay):
-    """Single step pulse; uses pigpio or GPIO."""
+FULL_STEPS = 200
+MICROSTEP  = 16
+GEAR_RATIO = 1.0
+STEPS_PER_DEG = (FULL_STEPS * MICROSTEP * GEAR_RATIO) / 360.0
+
+STEP_ON_US     = 12
+STEP_PERIOD_US = 1000
+DIR_SETUP_US   = 20
+DIR_HOLD_US    = 20
+
+X_MIN_DEG, X_MAX_DEG = 0.0, 120.0
+Y_MIN_DEG, Y_MAX_DEG = 0.0, 120.0
+
+SAFE_MODE = True
+VERBOSE = True
+
+USE_ENABLE_PINS = False
+EN_X_PIN = None
+EN_Y_PIN = None
+ENABLE_ACTIVE_LEVEL = 0
+
+# ----------------- GPIO abstraction -----------------
+def _setup_out(pin, idle_high=False):
+    if pin is None: return
     if PIGPIO:
-        pi.write(pin, 1)
-        time.sleep(delay/2)
-        pi.write(pin, 0)
-        time.sleep(delay/2)
+        pi.set_mode(pin, pigpio.OUTPUT)
+        pi.write(pin, 1 if idle_high else 0)
     else:
-        write(pin, 1)
-        time.sleep(delay/2)
-        write(pin, 0)
-        time.sleep(delay/2)
+        GPIO.setup(pin, GPIO.OUT, initial=GPIO.HIGH if idle_high else GPIO.LOW)
 
-def stepdir_move(step_pin, dir_pin, enable_pin, steps, delay=STEP_DELAY, direction=1):
-    """Move absolute number of pulses (microsteps)"""
-    if steps <= 0:
-        return True
-    # enable (active low assumed)
-    write(enable_pin, 0)
-    write(dir_pin, 1 if direction > 0 else 0)
-    for i in range(abs(steps)):
-        if stop_event.is_set() or emergency_pressed():
-            write(enable_pin, 1)
+def _setup_in_pullup(pin):
+    if pin is None: return
+    if PIGPIO:
+        pi.set_mode(pin, pigpio.INPUT)
+        pi.set_pull_up_down(pin, pigpio.PUD_UP)
+    else:
+        GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+def _w(pin, val):
+    if pin is None: return
+    if PIGPIO: pi.write(pin, 1 if val else 0)
+    else:      GPIO.output(pin, GPIO.HIGH if val else GPIO.LOW)
+
+def _r(pin):
+    if pin is None: return 1
+    if PIGPIO: return pi.read(pin)
+    else:      return GPIO.input(pin)
+
+# init IO
+_setup_out(STEP_X, idle_high=True)
+_setup_out(DIR_X,  idle_high=False)
+_setup_out(STEP_Y, idle_high=True)
+_setup_out(DIR_Y,  idle_high=False)
+_setup_out(FIRE,   idle_high=False)
+
+_setup_in_pullup(ESTOP)
+_setup_in_pullup(LIM_X_MIN)
+_setup_in_pullup(LIM_Y_MIN)
+if LIM_X_MAX is not None: _setup_in_pullup(LIM_X_MAX)
+if LIM_Y_MAX is not None: _setup_in_pullup(LIM_Y_MAX)
+
+if USE_ENABLE_PINS and EN_X_PIN is not None: _setup_out(EN_X_PIN, idle_high=(1-ENABLE_ACTIVE_LEVEL))
+if USE_ENABLE_PINS and EN_Y_PIN is not None: _setup_out(EN_Y_PIN, idle_high=(1-ENABLE_ACTIVE_LEVEL))
+
+# state
+estop_latched = False
+cur_x_steps = 0
+cur_y_steps = 0
+
+def log(*a):
+    if VERBOSE: print(*a)
+
+def estop_pressed_now():
+    return _r(ESTOP) == 0
+
+def limits_nc_tripped(pin):
+    return _r(pin) == 1
+
+def enable_axis(enable: bool):
+    if not USE_ENABLE_PINS: return
+    level = ENABLE_ACTIVE_LEVEL if enable else 1-ENABLE_ACTIVE_LEVEL
+    if EN_X_PIN is not None: _w(EN_X_PIN, level)
+    if EN_Y_PIN is not None: _w(EN_Y_PIN, level)
+
+def fire_once(seconds=0.1):
+    if SAFE_MODE:
+        log("[SAFE_MODE] would FIRE for", seconds, "s")
+        return
+    _w(FIRE, 1); time.sleep(seconds); _w(FIRE, 0)
+
+def _sleep_us(us):
+    time.sleep(us / 1_000_000.0)
+
+def step_pulse(pin_step, on_us=STEP_ON_US, period_us=STEP_PERIOD_US):
+    _w(pin_step, 0)
+    _sleep_us(on_us)
+    _w(pin_step, 1)
+    remain = max(0, period_us - on_us)
+    _sleep_us(remain)
+
+def set_dir(pin_dir, forward=True, invert=False):
+    level = 1 if (forward ^ invert) else 0
+    _w(pin_dir, level)
+    _sleep_us(DIR_SETUP_US)
+
+def emit_steps(pin_step, n_steps, on_us=STEP_ON_US, period_us=STEP_PERIOD_US):
+    for _ in range(n_steps):
+        if estop_latched or estop_pressed_now():
             return False
-        pulse_step_pin(step_pin, delay)
-    write(enable_pin, 1)
+        step_pulse(pin_step, on_us, period_us)
+    _sleep_us(DIR_HOLD_US)
     return True
 
-# ----------------- homing/calibration -----------------
-def pressed(pin):
-    # limit switches assumed active LOW (pressed => 0)
-    return read(pin) == 0
+def deg_to_steps(deg):
+    return int(round(deg * STEPS_PER_DEG))
 
-def home_axis(step_pin, dir_pin, en_pin, home_pin, max_pin, search_dir=1, delay=0.002):
-    """Homing routine returns (home_step=0, max_step) or (None, None) on abort."""
-    # enable driver
-    write(en_pin, 0)
-    # ensure we start away from home: if already pressed, back off
-    if pressed(home_pin):
-        stepdir_move(step_pin, dir_pin, en_pin, 200, delay=delay, direction=-search_dir)
-    # move toward home until pressed
-    steps = 0
-    while not pressed(home_pin):
-        if emergency_pressed() or stop_event.is_set():
-            write(en_pin, 1)
-            return None, None
-        stepdir_move(step_pin, dir_pin, en_pin, 1, delay=delay, direction=search_dir)
-        steps += 1
-    # define home = 0
-    # back off a little
-    stepdir_move(step_pin, dir_pin, en_pin, 50, delay=delay, direction=-search_dir)
-    time.sleep(0.05)
-    # find max
-    maxsteps = 0
-    while not pressed(max_pin):
-        if emergency_pressed() or stop_event.is_set():
-            write(en_pin, 1)
-            return None, None
-        stepdir_move(step_pin, dir_pin, en_pin, 1, delay=delay, direction=search_dir)
-        maxsteps += 1
-    write(en_pin, 1)
-    return 0, maxsteps
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
-def calibrate_all():
-    global cal_x, cal_y, current_x, current_y
-    with move_lock:
-        stop_event.clear()
-        hx, mx = home_axis(STEP_X, DIR_X, EN_X, LIMIT_X_HOME, LIMIT_X_MAX, search_dir=1)
-        if hx is None: return False
-        cal_x.home, cal_x.max_step = hx, mx
-        cal_x.steps_range = mx - hx if mx and mx>hx else None
-        current_x = cal_x.home
-        hy, my = home_axis(STEP_Y, DIR_Y, EN_Y, LIMIT_Y_HOME, LIMIT_Y_MAX, search_dir=1)
-        if hy is None: return False
-        cal_y.home, cal_y.max_step = hy, my
-        cal_y.steps_range = my - hy if my and my>hy else None
-        current_y = cal_y.home
+def estop_latch_if_pressed():
+    global estop_latched
+    if estop_pressed_now():
+        estop_latched = True
+        _w(FIRE, 0)
+        log(">>> E-STOP: latched (power to drivers should be OFF via mushroom).")
+    return estop_latched
+
+def estop_reset():
+    global estop_latched
+    if estop_pressed_now():
+        log("E-STOP still pressed; cannot reset.")
+        return False
+    log("Resetting E-STOP... waiting for drivers to re-energize...")
+    time.sleep(1.5)
+    estop_latched = False
     return True
 
-# ----------------- mapping & motion -----------------
-def norm_to_step_x(x_norm):
-    if cal_x.steps_range is None: raise RuntimeError("X not calibrated")
-    x = max(0.0, min(1.0, float(x_norm)))
-    return int(cal_x.home + x * cal_x.steps_range)
+# Homing
+def home_axis(name, pin_step, pin_dir, pin_lim, search_positive=True, backoff_deg=2.0, approach_period_us=2000):
+    global cur_x_steps, cur_y_steps
+    if estop_latch_if_pressed(): return None
+    away_forward = not search_positive
+    set_dir(pin_dir, forward=away_forward, invert=False)
+    tries = 0
+    while limits_nc_tripped(pin_lim):
+        if estop_latch_if_pressed(): return None
+        if not emit_steps(pin_step, 1, period_us=approach_period_us): return None
+        tries += 1
+        if tries > 20000:
+            log(f"[{name}] Unable to clear switch while backing off.")
+            return None
+    set_dir(pin_dir, forward=search_positive, invert=False)
+    tries = 0
+    while not limits_nc_tripped(pin_lim):
+        if estop_latch_if_pressed(): return None
+        if not emit_steps(pin_step, 1, period_us=approach_period_us): return None
+        tries += 1
+        if tries > 50000:
+            log(f"[{name}] Did not find home limit; check wiring and direction.")
+            return None
+    steps_back = deg_to_steps(backoff_deg)
+    set_dir(pin_dir, forward=away_forward, invert=False)
+    if not emit_steps(pin_step, steps_back, period_us=approach_period_us): return None
+    set_dir(pin_dir, forward=search_positive, invert=False)
+    if not emit_steps(pin_step, steps_back + deg_to_steps(0.5), period_us=approach_period_us): return None
+    if pin_step == STEP_X:
+        cur_x_steps = 0
+    else:
+        cur_y_steps = 0
+    log(f"[{name}] Homed. Set position = 0 steps.")
+    return 0
 
-def norm_to_step_y(y_norm):
-    if cal_y.steps_range is None: raise RuntimeError("Y not calibrated")
-    y = max(0.0, min(1.0, float(y_norm)))
-    return int(cal_y.home + y * cal_y.steps_range)
+def home_both():
+    log("Homing X...")
+    if home_axis("X", STEP_X, DIR_X, LIM_X_MIN, search_positive=True) is None: return False
+    log("Homing Y...")
+    if home_axis("Y", STEP_Y, DIR_Y, LIM_Y_MIN, search_positive=True) is None: return False
+    return True
 
-def move_to(x_norm, y_norm, step_delay=STEP_DELAY):
-    """Blocking move to normalized coords; moves X then Y."""
-    global current_x, current_y
-    tx = norm_to_step_x(x_norm); ty = norm_to_step_y(y_norm)
-    dx = tx - current_x
-    dy = ty - current_y
+def move_to_deg(x_deg, y_deg):
+    global cur_x_steps, cur_y_steps
+    if estop_latch_if_pressed(): return False
+    x_deg = clamp(x_deg, X_MIN_DEG, X_MAX_DEG)
+    y_deg = clamp(y_deg, Y_MIN_DEG, Y_MAX_DEG)
+    target_x = deg_to_steps(x_deg)
+    dx = target_x - cur_x_steps
     if dx != 0:
-        dirx = 1 if dx>0 else -1
-        ok = stepdir_move(STEP_X, DIR_X, EN_X, abs(dx), delay=step_delay, direction=dirx)
-        if not ok: return False
-        current_x = tx
+        set_dir(DIR_X, forward=(dx > 0), invert=False)
+        if not emit_steps(STEP_X, abs(dx)): return False
+        cur_x_steps = target_x
+    target_y = deg_to_steps(y_deg)
+    dy = target_y - cur_y_steps
     if dy != 0:
-        diry = 1 if dy>0 else -1
-        ok = stepdir_move(STEP_Y, DIR_Y, EN_Y, abs(dy), delay=step_delay, direction=diry)
-        if not ok: return False
-        current_y = ty
+        set_dir(DIR_Y, forward=(dy > 0), invert=False)
+        if not emit_steps(STEP_Y, abs(dy)): return False
+        cur_y_steps = target_y
     return True
 
-# ----------------- CSV loader & runner -----------------
-def load_csv(path):
+def move_norm(x_norm, y_norm):
+    xd = X_MIN_DEG + clamp(x_norm, 0.0, 1.0) * (X_MAX_DEG - X_MIN_DEG)
+    yd = Y_MIN_DEG + clamp(y_norm, 0.0, 1.0) * (Y_MAX_DEG - Y_MIN_DEG)
+    return move_to_deg(xd, yd)
+
+CSV_IS_NORMALIZED = True
+def load_points(csv_path):
     pts = []
-    with open(path, newline='') as f:
-        reader = csv.reader(f)
-        for row in reader:
-            if not row: continue
+    with open(csv_path, newline='') as f:
+        r = csv.reader(f)
+        for row in r:
+            if not row or row[0].strip().startswith("#"): continue
             try:
-                x = float(row[0]); y = float(row[1])
+                a = float(row[0]); b = float(row[1])
             except Exception:
                 continue
-            pts.append((x,y))
+            pts.append((a, b))
     return pts
 
-def fire_once():
-    if SAFE_MODE:
-        print("[SAFE_MODE] would fire here")
-        return
-    # actual pulse:
-    write(TRIGGER_PIN, 1)
-    time.sleep(FIRE_PULSE_SECONDS)
-    write(TRIGGER_PIN, 0)
-
-def run_graph(points, delay_between=0.2, step_delay=STEP_DELAY):
-    stop_event.clear()
-    for (x,y) in points:
-        if stop_event.is_set() or emergency_pressed():
-            print("Stopped by stop_event or emergency")
-            break
-        print(f"Moving to {x:.3f},{y:.3f}")
-        ok = move_to(x,y, step_delay=step_delay)
+def run_points(pts, dwell_s=0.2):
+    for (a,b) in pts:
+        if estop_latch_if_pressed(): break
+        ok = move_norm(a,b) if CSV_IS_NORMALIZED else move_to_deg(a,b)
         if not ok:
-            print("Move aborted")
-            break
-        print("Reached point; firing (if enabled)")
-        fire_once()
-        time.sleep(delay_between)
-    print("Graph run complete")
+            log("Move aborted."); break
+        fire_once(0.10)
+        time.sleep(dwell_s)
+    log("Sequence complete.")
 
-# ----------------- CLI test runner -----------------
-def interactive_test():
-    print("Turret Graph & Fire - Interactive Test")
-    print("1) Calibrate/homing")
-    print("2) Load CSV and dry run")
-    print("3) Load CSV and run (LIVE if SAFE_MODE=False)")
-    print("4) Exit")
-    while True:
-        c = input("Choose: ").strip()
-        if c=='1':
-            print("Calibrating (homing) - be ready to stop!")
-            ok = calibrate_all()
-            print("Calibration:", ok)
-        elif c=='2':
-            p = input("CSV path: ").strip()
-            pts = load_csv(p)
-            print("Loaded", len(pts), "points")
-            run_graph(pts, delay_between=0.1)
-        elif c=='3':
-            p = input("CSV path: ").strip()
-            pts = load_csv(p)
-            print("Loaded", len(pts), "points")
-            run_graph(pts, delay_between=0.1)
-        elif c=='4':
-            break
-        else:
-            print("Unknown")
+# ---------------------------
+# END hardware core
+# ---------------------------
 
-# ----------------- cleanup -----------------
-def cleanup_and_exit():
-    write(EN_X, 1); write(EN_Y, 1); write(TRIGGER_PIN, 0)
-    if PIGPIO:
-        pi.stop()
+# ---------------------------
+# BEGIN: Flask web UI + image parsing + camera snapshot
+# ---------------------------
+
+UPLOAD_DIR = Path.home() / "turret_project" / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+app = Flask(__name__)
+
+# Simple HTML template (small, inline)
+TEMPLATE = """
+<!doctype html>
+<title>VPP Turret UI</title>
+<h2>VPP Turret Control UI</h2>
+<p>SAFE_MODE: <strong>{{ safe }}</strong></p>
+<form action="/toggle-safe" method="post"><button type="submit">{{ 'Disable SAFE' if safe else 'Enable SAFE' }}</button></form>
+<form action="/home" method="post"><button type="submit">Home Both Axes</button></form>
+<form action="/selftest" method="post">
+  <label>Self-test axis:
+    <select name="axis"><option value="x">X</option><option value="y">Y</option></select>
+  </label>
+  <button type="submit">Run</button>
+</form>
+<form action="/upload" method="post" enctype="multipart/form-data">
+  <p>Upload graph image (JPEG/PNG): <input type=file name=file></p>
+  <p><button type="submit">Upload & Parse</button></p>
+</form>
+<p><a href="/uploads">List uploaded images</a> | <a href="/camera">Camera snapshot</a></p>
+<form action="/run-upload" method="post">
+  <label>Choose uploaded image file:
+    <input name="fname" placeholder="uploads/yourimage.png">
+  </label>
+  <button type="submit">Plot uploaded image (dry run)</button>
+</form>
+<form action="/run-csv" method="post" enctype="multipart/form-data">
+  <p>Upload CSV file (x,y 0..1): <input type=file name=csvfile></p>
+  <p><button type="submit">Upload CSV & Dry Run</button></p>
+</form>
+<form action="/fire" method="post">
+  <p><button type="submit">FIRE (respects SAFE_MODE)</button></p>
+</form>
+<pre>{{ log }}</pre>
+"""
+
+# shared log buffer
+web_log = []
+
+def web_log_add(msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    web_log.append(f"[{ts}] {msg}")
+    if len(web_log) > 200: web_log.pop(0)
+
+@app.route("/")
+def index():
+    return render_template_string(TEMPLATE, safe=SAFE_MODE, log="\n".join(web_log[-50:]))
+
+@app.route("/toggle-safe", methods=["POST"])
+def toggle_safe():
+    global SAFE_MODE
+    SAFE_MODE = not SAFE_MODE
+    web_log_add(f"SAFE_MODE set to {SAFE_MODE}")
+    return redirect(url_for("index"))
+
+@app.route("/home", methods=["POST"])
+def web_home():
+    web_log_add("Web: Home requested")
+    def do_home():
+        ok = home_both()
+        web_log_add(f"Homing result: {ok}")
+    threading.Thread(target=do_home, daemon=True).start()
+    return redirect(url_for("index"))
+
+@app.route("/selftest", methods=["POST"])
+def web_selftest():
+    axis = request.form.get("axis","x")
+    web_log_add(f"Web: Self-test {axis}")
+    def do_test():
+        if axis=="x": wiring_self_test_x()
+        else: wiring_self_test_y()
+        web_log_add("Self-test done.")
+    threading.Thread(target=do_test, daemon=True).start()
+    return redirect(url_for("index"))
+
+@app.route("/upload", methods=["POST"])
+def upload_image():
+    f = request.files.get("file")
+    if not f:
+        web_log_add("No file uploaded.")
+        return redirect(url_for("index"))
+    fn = f.filename
+    safe_fn = f"{int(time.time())}_{os.path.basename(fn)}"
+    out = UPLOAD_DIR / safe_fn
+    f.save(str(out))
+    web_log_add(f"Saved upload: {out.name}")
+    # parse it
+    pts, preview_bytes = parse_graph_image(str(out))
+    if pts is None:
+        web_log_add("Image parsing failed.")
     else:
-        GPIO.cleanup()
-    print("Cleaned up. Exiting.")
-    sys.exit(0)
+        # save preview
+        preview_path = out.with_suffix(".preview.png")
+        with open(preview_path, "wb") as pf: pf.write(preview_bytes)
+        web_log_add(f"Parsed {len(pts)} points. Preview saved: {preview_path.name}")
+    return redirect(url_for("index"))
 
-# ----------------- run if called -----------------
-if __name__ == "__main__":
+@app.route("/uploads")
+def list_uploads():
+    files = sorted([p.name for p in UPLOAD_DIR.glob("*")], reverse=True)
+    html = "<h3>Uploads</h3><ul>"
+    for f in files:
+        html += f'<li><a href="/download/{f}">{f}</a></li>'
+    html += "</ul><a href='/'>Back</a>'"
+    return html
+
+@app.route("/download/<path:fname>")
+def download(fname):
+    p = UPLOAD_DIR / fname
+    if not p.exists(): return "Not found", 404
+    return send_file(str(p))
+
+@app.route("/run-upload", methods=["POST"])
+def run_upload():
+    fname = request.form.get("fname","").strip()
+    if not fname:
+        web_log_add("No filename provided")
+        return redirect(url_for("index"))
+    p = UPLOAD_DIR / Path(fname).name
+    if not p.exists():
+        web_log_add("File not found: " + str(p))
+        return redirect(url_for("index"))
+    web_log_add("Parsing and dry-running: " + p.name)
+    pts, _ = parse_graph_image(str(p))
+    if pts is None or len(pts)==0:
+        web_log_add("Parsing produced no points.")
+        return redirect(url_for("index"))
+    # run in background (dry run respects SAFE_MODE)
+    def do_run():
+        web_log_add("Running parsed points (dry run)...")
+        run_points(pts, dwell_s=0.15)
+        web_log_add("Run complete.")
+    threading.Thread(target=do_run, daemon=True).start()
+    return redirect(url_for("index"))
+
+@app.route("/run-csv", methods=["POST"])
+def run_csv():
+    f = request.files.get("csvfile")
+    if not f:
+        web_log_add("No CSV uploaded.")
+        return redirect(url_for("index"))
+    fname = f"csv_{int(time.time())}.csv"
+    p = UPLOAD_DIR / fname
+    f.save(str(p))
+    web_log_add("Saved CSV: " + fname)
+    pts = load_points(str(p))
+    web_log_add(f"Loaded {len(pts)} points from CSV.")
+    def do_run():
+        run_points(pts, dwell_s=0.12)
+        web_log_add("CSV run complete.")
+    threading.Thread(target=do_run, daemon=True).start()
+    return redirect(url_for("index"))
+
+@app.route("/camera")
+def camera_snapshot():
+    # capture a single frame and return PNG
     try:
-        print("SAFE_MODE =", SAFE_MODE)
-        interactive_test()
+        frame = capture_camera_frame()
+        if frame is None: return "No camera", 500
+        # encode as PNG and return
+        is_ok, buf = cv2.imencode(".png", frame)
+        return send_file(io.BytesIO(buf.tobytes()), mimetype="image/png", download_name="snapshot.png")
+    except Exception as e:
+        return f"Camera error: {e}", 500
+
+@app.route("/fire", methods=["POST"])
+def web_fire():
+    web_log_add("FIRE requested from web UI")
+    def do_fire():
+        fire_once(0.10)
+        web_log_add("FIRE action done (or skipped due to SAFE_MODE).")
+    threading.Thread(target=do_fire, daemon=True).start()
+    return redirect(url_for("index"))
+
+# ---------------------------
+# IMAGE PARSING: graph image -> normalized points (0..1)
+# ---------------------------
+def parse_graph_image(path, max_points=600):
+    """
+    Accepts an image path, returns a list of (x_norm, y_norm) in range 0..1
+    and a PNG preview bytes object (image with detected points overlay).
+    Strategy:
+      - Read image, convert to grayscale.
+      - Adaptive threshold / invert if necessary so graph line is white on black.
+      - Find the largest connected component / contour.
+      - Compute bounding box of the line region as plotting area.
+      - Sample N points along the contour and map to normalized coords using bbox.
+    Notes:
+      - Best results when the graph line is a dark colored curve on a light background,
+        no axes clutter. If your graph has axes or tick marks, cropping to the plotted area helps.
+    """
+    try:
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            web_log_add("cv2.imread failed")
+            return None, None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # 1) enhance contrast if needed
+        gray = cv2.equalizeHist(gray)
+
+        # 2) blur and threshold
+        blur = cv2.GaussianBlur(gray, (5,5), 0)
+        # use adaptive or Otsu threshold depending on contrast
+        _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # decide if graph is dark-on-light or light-on-dark: we want line=255
+        # if background is dark (mean<127), invert
+        if np.mean(th) < 127:
+            th = cv2.bitwise_not(th)
+
+        # 3) remove small specks, keep large components
+        kernel = np.ones((3,3), np.uint8)
+        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
+        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        # 4) find contours
+        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            web_log_add("No contours found in image")
+            return None, None
+
+        # pick the largest contour by length (graph stroke)
+        contours = sorted(contours, key=lambda c: c.shape[0], reverse=True)
+        main = contours[0]
+
+        # bounding box for normalization
+        x,y,w,h = cv2.boundingRect(main)
+        if w < 5 or h < 5:
+            web_log_add("Bounding box too small")
+            return None, None
+
+        # resample contour to max_points evenly along arclength
+        # compute cumulative distances
+        pts = main.squeeze().astype(np.float32)
+        if pts.ndim != 2 or pts.shape[0] < 2:
+            web_log_add("Contour too small")
+            return None, None
+        dists = np.sqrt(((pts[1:] - pts[:-1])**2).sum(axis=1))
+        cum = np.concatenate(([0.0], np.cumsum(dists)))
+        total = cum[-1]
+        if total <= 0:
+            web_log_add("Contour length zero")
+            return None, None
+
+        sample_n = min(max_points, len(pts))
+        samples = np.linspace(0, total, sample_n)
+        res = []
+        j = 0
+        for s in samples:
+            while j < len(cum)-1 and cum[j+1] < s:
+                j += 1
+            if j >= len(pts)-1:
+                res.append(pts[-1])
+            else:
+                t = (s - cum[j]) / (cum[j+1] - cum[j]) if (cum[j+1] - cum[j])>0 else 0
+                p = (1-t)*pts[j] + t*pts[j+1]
+                res.append(p)
+        res = np.array(res)  # shape (N,2)
+
+        # Map to normalized coordinates using bbox (x..x+w, y..y+h)
+        # Note: image y increases downward; we flip to have norm y increase upward
+        norm_pts = []
+        for px,py in res:
+            xn = (px - x) / float(w)
+            yn = 1.0 - ((py - y) / float(h))
+            xn = float(np.clip(xn, 0.0, 1.0))
+            yn = float(np.clip(yn, 0.0, 1.0))
+            norm_pts.append((xn, yn))
+
+        # create preview overlay
+        vis = img.copy()
+        # draw bounding box
+        cv2.rectangle(vis, (x,y), (x+w,y+h), (0,255,0), 2)
+        # draw sampled points
+        for (xn,yn) in norm_pts[::max(1, len(norm_pts)//400)]:
+            px = int(x + xn * w); py = int(y + (1.0-yn) * h)
+            cv2.circle(vis, (px,py), 2, (0,0,255), -1)
+        # encode preview as PNG bytes
+        is_ok, buf = cv2.imencode(".png", vis)
+        return norm_pts, buf.tobytes()
+    except Exception as e:
+        web_log_add("parse_graph_image error: " + str(e))
+        return None, None
+
+# ---------------------------
+# Camera capture helper
+# ---------------------------
+def capture_camera_frame():
+    """
+    Capture a single frame from the Pi camera (or USB camera) and return a BGR numpy array.
+    Uses cv2.VideoCapture(0). On Raspberry Pi OS with libcamera, you may prefer picamera2.
+    """
+    try:
+        cap = cv2.VideoCapture(0)  # device 0
+        if not cap.isOpened():
+            web_log_add("camera not available (VideoCapture failed)")
+            return None
+        # set small resolution to speed up
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            web_log_add("camera read failed")
+            return None
+        return frame
+    except Exception as e:
+        web_log_add("capture_camera_frame error: " + str(e))
+        return None
+
+# ---------------------------
+# Start Flask app (in background thread) so CLI still works
+# ---------------------------
+def run_flask():
+    # accessible on all interfaces for touchscreen or remote browser
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+
+# ---------------------------
+# CLI menu (keeps compatibility with earlier script)
+# ---------------------------
+def main_menu_cli():
+    print("\nVPP Turret Control (with UI)")
+    print("SAFE_MODE =", SAFE_MODE)
+    print("[0] Wiring self-test (X)")
+    print("[9] Wiring self-test (Y)")
+    print("[1] Home both axes")
+    print("[2] Move to degrees (X Y)")
+    print("[3] Move to normalized (X Y in 0..1)")
+    print("[4] Run CSV")
+    print("[5] Toggle SAFE_MODE (current: %s)" % SAFE_MODE)
+    print("[6] Reset E-STOP latch")
+    print("[7] Start/Show UI address")
+    print("[q] Quit")
+
+def wiring_self_test_x():
+    log("Self-test X: forward...")
+    set_dir(DIR_X, forward=True)
+    if not emit_steps(STEP_X, deg_to_steps(45), period_us=STEP_PERIOD_US): return
+    time.sleep(0.2)
+    log("Self-test X: back...")
+    set_dir(DIR_X, forward=False)
+    emit_steps(STEP_X, deg_to_steps(45), period_us=STEP_PERIOD_US)
+    log("Done.")
+
+def wiring_self_test_y():
+    log("Self-test Y: forward...")
+    set_dir(DIR_Y, forward=True)
+    if not emit_steps(STEP_Y, deg_to_steps(45), period_us=STEP_PERIOD_US): return
+    time.sleep(0.2)
+    log("Self-test Y: back...")
+    set_dir(DIR_Y, forward=False)
+    emit_steps(STEP_Y, deg_to_steps(45), period_us=STEP_PERIOD_US)
+    log("Done.")
+
+# ---------------------------
+# Program entry point
+# ---------------------------
+if __name__ == "__main__":
+    # start Flask UI thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    web_log_add("Flask UI started on port 5000")
+
+    try:
+        while True:
+            main_menu_cli()
+            c = input("Choose: ").strip().lower()
+            if c == '0':
+                wiring_self_test_x()
+            elif c == '9':
+                wiring_self_test_y()
+            elif c == '1':
+                ok = home_both()
+                print("Home:", ok)
+            elif c == '2':
+                try:
+                    x = float(input("X deg: "))
+                    y = float(input("Y deg: "))
+                except Exception:
+                    print("bad numbers"); continue
+                print("Move:", move_to_deg(x, y))
+            elif c == '3':
+                try:
+                    x = float(input("X norm (0..1): "))
+                    y = float(input("Y norm (0..1): "))
+                except Exception:
+                    print("bad numbers"); continue
+                print("Move:", move_norm(x, y))
+            elif c == '4':
+                p = input("CSV path: ").strip()
+                if not Path(p).exists():
+                    print("File not found."); continue
+                pts = load_points(p)
+                print("Loaded", len(pts), "points.")
+                run_points(pts, dwell_s=0.1)
+            elif c == '5':
+                SAFE = input("SAFE_MODE True/False: ").strip().lower()
+                globals()['SAFE_MODE'] = (SAFE in ('1','true','t','yes','y'))
+                print("SAFE_MODE now:", SAFE_MODE)
+            elif c == '6':
+                if estop_reset():
+                    print("Latch cleared. Re-home before motion.")
+            elif c == '7':
+                print("Open this Pi's browser or remote browser to http://<pi-ip>:5000")
+            elif c == 'q':
+                break
+            else:
+                print("Unknown choice.")
     except KeyboardInterrupt:
         pass
     finally:
-        cleanup_and_exit()
+        try:
+            _w(FIRE, 0)
+            if not PIGPIO:
+                GPIO.cleanup()
+            else:
+                pi.stop()
+        except Exception:
+            pass
+        print("Clean exit.")
