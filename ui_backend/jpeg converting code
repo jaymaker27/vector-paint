@@ -1,0 +1,29 @@
+import cv2
+import numpy as np
+import csv
+import sys
+
+# Load image
+image_path = input("Enter image filename (e.g., my_image.jpg): ").strip()
+img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+if img is None:
+    print("Error: Image not found!")
+    sys.exit(1)
+
+# Resize to fit turret range (adjust as needed)
+img = cv2.resize(img, (50, 50))  # smaller = fewer points
+
+# Convert to black & white
+_, thresh = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
+
+# Find edge coordinates
+points = np.column_stack(np.where(thresh > 0))
+
+# Save to CSV
+csv_filename = image_path.split('.')[0] + ".csv"
+with open(csv_filename, "w", newline="") as f:
+    writer = csv.writer(f)
+    for (y, x) in points:  # note swapped order
+        writer.writerow([x/50.0, y/50.0])  # normalize to 0–1 range
+
+print(f"Saved {len(points)} points to {csv_filename}")
