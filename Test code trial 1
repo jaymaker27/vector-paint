@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+import RPi.GPIO as GPIO
+import time
+
+# ---------------- CONFIG ----------------
+# Motor pins (BCM)
+STEP_X, DIR_X = 23, 24
+STEP_Y, DIR_Y = 20, 21
+
+# Limit switches (BCM)
+# Assumed wiring: NC -> GND, so:
+#   - Not pressed: pin = 0
+#   - Pressed (opened): pin = 1 (via pull-up)
+LIM_X_MIN = 17
+LIM_Y_MIN = 22
+
+# E-STOP (BCM)
+# Assumed wiring: NO -> GND, so:
+#   - Not pressed: pin = 1 (pulled up)
+#   - Pressed: pin = 0
+ESTOP_PIN = 25
+
+# Step timing
+STEP_PERIOD_US = 2000   # 2000 us -> 500 steps/sec (nice and gentle)
+STEP_ON_US     = 50     # width of the active-low pulse (us)
+
+# Debounce settings
+DEB_SAMPLES   = 8       # how many samples to take
+DEB_INTERVAL_S = 0.0005 # time between samples (seconds)
+
+
+# ---------------- INIT ----------------
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# Outputs: STEP idle HIGH, DIR LOW
+for pin in (STEP_X, STEP_Y):
+    GPIO.setup(pin, GPIO.OUT, initial=GPIO.HIGH)  # STEP idle HIGH (active-LOW pulse)
+
+for pin in (DIR_X, DIR_Y):
+    GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)   # DIR default LOW
+
+# Inputs with pull-ups
+GPIO.setup(LIM_X_MIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(LIM_Y_MIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(ESTOP_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+# Set directions so that motion goes *toward* the limit switches.
+# If a motor goes the wrong way, flip the 0/1 here or swap motor wires.
+GPIO.output(DIR_X, GPIO.HIGH)   # 1 = "toward switch" (adjust if needed)
+GPIO.output(DIR_Y, GPIO.HIGH)
+
+
+# ---------------- HELPERS ----------------
+def read_debounced(pin, samples=DEB_SAMPLES, interval_s=DEB_INTERVAL_S):
+    """Return 0 or 1 after majority vote over several fast samples."""
+    ones = 0
+    for _ in range(samples):
+        ones += GPIO.input(pin)
+        time.sleep(interval_s)
+    return 1 if ones > samples // 2 else 0
+
+
+def estop_pressed():
+    # E-STOP assumed NO->GND: pressed = 0
+    return read_debounced(ESTOP_PIN) == 0
+
+
+def limit_tripped(pin):
+    # Limits assumed NC->GND: pressed (opened) = 1
+    return read_debounced(pin) == 1
+
+
+def step(pin_step, on_us=STEP_ON_US, period_us=STEP_PERIOD_US):
+    """Single active-LOW step pulse."""
+    GPIO.output(pin_step, GPIO.LOW)
+    time.sleep(on_us / 1_000_000.0)
+    GPIO.output(pin_step, GPIO.HIGH)
+    remain = max(0, period_us - on_us)
+    time.sleep(remain / 1_000_000.0)
+
+
+# ---------------- MAIN TEST ----------------
+print("Debounced limit-switch test")
+print("  X limit  (BCM {}), Y limit (BCM {})".format(LIM_X_MIN, LIM_Y_MIN))
+print("  E-STOP   (BCM {})".format(ESTOP_PIN))
+print("Assumptions:")
+print("  - Limits: NC -> GND, pressed = 1")
+print("  - E-STOP: NO  -> GND, pressed = 0\n")
+
+# Show initial raw states
+print("Initial switch states (0 = not pressed):")
+print("  LIM_X_MIN:", GPIO.input(LIM_X_MIN),
+      "  LIM_Y_MIN:", GPIO.input(LIM_Y_MIN),
+      "  ESTOP:", GPIO.input(ESTOP_PIN))
+print("Starting motion... Ctrl+C to abort.\n")
+
+x_done = False
+y_done = False
+
+try:
+    while not (x_done and y_done):
+        if estop_pressed():
+            print("E-STOP PRESSED. Stopping all motion.")
+            break
+
+        if not x_done:
+            if limit_tripped(LIM_X_MIN):
+                print("X switch hit (debounced). Stopping X motor.")
+                x_done = True
+            else:
+                step(STEP_X)
+
+        if not y_done:
+            if limit_tripped(LIM_Y_MIN):
+                print("Y switch hit (debounced). Stopping Y motor.")
+                y_done = True
+            else:
+                step(STEP_Y)
+
+    print("Test complete. x_done =", x_done, "  y_done =", y_done)
+
+except KeyboardInterrupt:
+    print("\nInterrupted by user.")
+
+finally:
+    GPIO.cleanup()
+    print("GPIO cleaned up. Bye.")
