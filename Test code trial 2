@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""
+turret_graphing_stepdir.py
+
+Updated: homing until limit switches change, debouncing, EN placeholders,
+uses provided GPIO mapping and keeps UI/camera/CSV graphing.
+
+Behavior/assumptions:
+ - Limit switches are NC to GND, with pull-ups on the GPIO pins.
+   * Normal (not tripped) reading = LOW (0) because NC ties to GND.
+   * Tripped / opened    reading = HIGH (1) because pull-up pulls it high.
+ - Homing rotates the motor until the switch becomes HIGH (i.e. opens),
+   then backs off and re-approaches slowly to find a cleaner edge.
+"""
+
+import threading, time, csv, queue, os
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+import numpy as np
+import cv2
+
+# Try pigpio (recommended for accurate pulses); fall back to RPi.GPIO if missing
+try:
+    import pigpio
+    PIGPIO_AVAILABLE = True
+except Exception:
+    PIGPIO_AVAILABLE = False
+    import RPi.GPIO as GPIO
+
+# ----------------------
+# Pin configuration (BCM) - user provided
+# ----------------------
+STEP_X_PIN = 23
+DIR_X_PIN  = 24
+STEP_Y_PIN = 20
+DIR_Y_PIN  = 21
+
+# leave enable pins as placeholders for you to fill later
+EN_X_PIN = None
+EN_Y_PIN = None
+
+# Limit switches (NC to GND; pull-up -> LOW when normal, HIGH when tripped/open)
+LIMIT_X_HOME = 17
+LIMIT_Y_HOME = 22
+
+# Not using MAX switches in this version
+LIMIT_X_MAX  = None
+LIMIT_Y_MAX  = None
+
+EMERGENCY_PIN = 25  # ESTOP (NO->GND) per your mapping (pressed -> LOW) - we'll debounce
+
+# Camera device index (adjust if needed)
+CAMERA_DEVICE = 0
+
+# Motor / microstep config (set physically on DM556D)
+MOTOR_FULL_STEPS = 200
+MICROSTEP_SETTING = 16
+STEPS_PER_REV = MOTOR_FULL_STEPS * MICROSTEP_SETTING
+
+# Default step timing (seconds). Adjust for safe speeds.
+DEFAULT_STEP_DELAY = 0.0008  # 0.8 ms between edges; increase if missed steps
+
+# ----------------------
+# State & calibration
+# ----------------------
+class AxisCalibration:
+    def __init__(self):
+        self.home = 0
+        self.max_step = None
+        self.steps_per_unit = None
+
+cal_x = AxisCalibration()
+cal_y = AxisCalibration()
+
+current_x_step = 0
+current_y_step = 0
+
+stop_event = threading.Event()
+movement_lock = threading.Lock()
+
+# Software debounce settings
+DEBOUNCE_SAMPLES = 6
+DEBOUNCE_INTERVAL = 0.008  # 8 ms between samples -> ~48 ms total
+
+# ----------------------
+# GPIO abstraction functions
+# ----------------------
+if PIGPIO_AVAILABLE:
+    pi = pigpio.pi()
+    if not pi.connected:
+        raise RuntimeError("pigpio daemon not running or connection failed. Start pigpiod.")
+    def gpio_setup_output(pin):
+        if pin is None: return
+        pi.set_mode(pin, pigpio.OUTPUT)
+        # default idle: STEP pins HIGH (active-LOW stepping), DIR LOW
+        # we won't force idle levels here; caller will write explicitly
+    def gpio_write(pin, level):
+        if pin is None: return
+        pi.write(pin, 1 if level else 0)
+    def gpio_setup_input(pin):
+        if pin is None: return
+        pi.set_mode(pin, pigpio.INPUT)
+        pi.set_pull_up_down(pin, pigpio.PUD_UP)
+    def gpio_read(pin):
+        if pin is None: return 1
+        return pi.read(pin)
+else:
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    def gpio_setup_output(pin):
+        if pin is None: return
+        GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+    def gpio_write(pin, level):
+        if pin is None: return
+        GPIO.output(pin, GPIO.HIGH if level else GPIO.LOW)
+    def gpio_setup_input(pin):
+        if pin is None: return
+        GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    def gpio_read(pin):
+        if pin is None: return 1
+        return GPIO.input(pin)
+
+# ----------------------
+# Initialize pins
+# ----------------------
+for p in [STEP_X_PIN, DIR_X_PIN, STEP_Y_PIN, DIR_Y_PIN, EN_X_PIN, EN_Y_PIN]:
+    gpio_setup_output(p)
+for p in [LIMIT_X_HOME, LIMIT_Y_HOME, EMERGENCY_PIN]:
+    gpio_setup_input(p)
+
+# disable drivers initially if enable pins provided (assume active-low enable)
+if EN_X_PIN is not None:
+    gpio_write(EN_X_PIN, 1)
+if EN_Y_PIN is not None:
+    gpio_write(EN_Y_PIN, 1)
+
+# Helper: human-friendly log
+def log(*a):
+    print("[TURRET]", *a)
+
+# ----------------------
+# Debounced reads
+# ----------------------
+def read_debounced(pin, samples=DEBOUNCE_SAMPLES, interval=DEBOUNCE_INTERVAL):
+    """
+    Returns stable boolean state (0 or 1) after sampling `samples` times.
+    If values vary, returns the majority value.
+    """
+    vals = []
+    for _ in range(samples):
+        vals.append(gpio_read(pin))
+        time.sleep(interval)
+    # majority
+    ones = sum(1 for v in vals if v)
+    return 1 if ones >= (samples/2) else 0
+
+# Interpret limit switch logic (NC to GND + pull-up):
+# - Normal (not tripped): pin reads LOW (0) because NC ties to GND
+# - Tripped/open:           pin reads HIGH (1) because pull-up pulls it high
+def limit_tripped(pin):
+    # return True when the switch is *tripped/open* (reads HIGH)
+    return read_debounced(pin) == 1
+
+def emergency_pressed():
+    # EMERGENCY_PIN is NO->GND per your note (pressed => LOW)
+    # We'll debounce and treat LOW as pressed
+    return read_debounced(EMERGENCY_PIN) == 0
+
+# ----------------------
+# Low-level stepping (pigpio & GPIO fallback)
+# ----------------------
+def _safe_sleep_us(us):
+    time.sleep(us / 1_000_000.0)
+
+def step_pulse_once(step_pin, step_delay):
+    # active-LOW pulse: idle HIGH, pull LOW for short time, then HIGH
+    # but many drivers accept either edge; we will toggle as in original code
+    gpio_write(step_pin, 1)
+    # short high hold then low then high - keep consistent with what's used elsewhere
+    gpio_write(step_pin, 0)
+    # leave low for half period
+    time.sleep(step_delay/2.0)
+    gpio_write(step_pin, 1)
+    time.sleep(step_delay/2.0)
+
+def stepdir_move_steps(step_pin, dir_pin, steps, step_delay=DEFAULT_STEP_DELAY, direction=1, enable_pin=None):
+    """
+    Generic stepping loop. Uses pigpio.pi.write if pigpio available or GPIO write fallback.
+    direction: 1 or -1 (we interpret 1 -> gpio_write(dir_pin, 1))
+    enable_pin: if provided, driver EN active-low will be toggled
+    """
+    if steps <= 0:
+        return True
+    # set dir
+    gpio_write(dir_pin, 1 if direction == 1 else 0)
+    # enable if available (active-low)
+    if enable_pin is not None:
+        gpio_write(enable_pin, 0)
+    # step loop
+    for i in range(steps):
+        if stop_event.is_set() or emergency_pressed():
+            break
+        # pulse - use simple toggle (keeps it platform independent)
+        gpio_write(step_pin, 0)
+        time.sleep(step_delay/2.0)
+        gpio_write(step_pin, 1)
+        time.sleep(step_delay/2.0)
+    # disable
+    if enable_pin is not None:
+        gpio_write(enable_pin, 1)
+    return True
+
+# ----------------------
+# Homing and calibration
+# ----------------------
+def home_axis_until_switch(step_pin, dir_pin, enable_pin, home_pin, search_direction=1, coarse_delay=0.002, fine_delay=0.001, backoff_steps_deg=2.0):
+    """
+    Homing that uses only a single NC home switch.
+    - If switch is currently tripped (open/HIGH), back off until it returns to normal (LOW).
+    - Then move toward the switch until it becomes tripped (HIGH).
+    - Back off a fixed distance and re-approach slowly for a clean edge.
+    Returns home_step (0) and estimated max_steps (None since we don't use MAX in this build).
+    """
+    # enable driver
+    if enable_pin is not None:
+        gpio_write(enable_pin, 0)
+
+    # If currently tripped/open (HIGH), back off until normal (LOW)
+    tries = 0
+    while limit_tripped(home_pin):
+        if stop_event.is_set() or emergency_pressed():
+            if enable_pin is not None: gpio_write(enable_pin, 1)
+            return None, None
+        # move away from switch (opposite of search_direction)
+        stepdir_move_steps(step_pin, dir_pin, 1, step_delay=coarse_delay, direction=-search_direction, enable_pin=enable_pin)
+        tries += 1
+        if tries > 20000:
+            log("Homing: couldn't clear a stuck switch, aborting.")
+            if enable_pin is not None: gpio_write(enable_pin, 1)
+            return None, None
+
+    # Now approach until switch trips (becomes HIGH)
+    tries = 0
+    while not limit_tripped(home_pin):
+        if stop_event.is_set() or emergency_pressed():
+            if enable_pin is not None: gpio_write(enable_pin, 1)
+            return None, None
+        stepdir_move_steps(step_pin, dir_pin, 1, step_delay=coarse_delay, direction=search_direction, enable_pin=enable_pin)
+        tries += 1
+        if tries > 1000000:
+            log("Homing: approach timed out.")
+            if enable_pin is not None: gpio_write(enable_pin, 1)
+            return None, None
+
+    # we hit the edge -> back off a little (in steps)
+    # convert degrees to steps for backoff (backoff_steps_deg is degrees)
+    backoff_steps = int(round((backoff_steps_deg/360.0) * STEPS_PER_REV))
+    if backoff_steps < 1: backoff_steps = 1
+
+    stepdir_move_steps(step_pin, dir_pin, backoff_steps, step_delay=coarse_delay, direction=-search_direction, enable_pin=enable_pin)
+    time.sleep(0.05)
+
+    # re-approach slowly for clean edge detection
+    stepdir_move_steps(step_pin, dir_pin, backoff_steps + int(round(0.5/360.0*STEPS_PER_REV)), step_delay=fine_delay, direction=search_direction, enable_pin=enable_pin)
+
+    # disable driver
+    if enable_pin is not None:
+        gpio_write(enable_pin, 1)
+
+    # Set home = 0. We don't compute max here (no MAX switch).
+    return 0, None
+
+def calibrate_all(step_delay=DEFAULT_STEP_DELAY):
+    """
+    Calibrate X and Y sequentially. Blocking. Returns True on success.
+    """
+    global cal_x, cal_y, current_x_step, current_y_step
+    with movement_lock:
+        stop_event.clear()
+        log("Calibrating X...")
+        hx, mx = home_axis_until_switch(STEP_X_PIN, DIR_X_PIN, EN_X_PIN, LIMIT_X_HOME, search_direction=1, coarse_delay=step_delay)
+        if hx is None:
+            log("X homing failed.")
+            return False
+        cal_x.home = hx
+        cal_x.max_step = mx
+        cal_x.steps_per_unit = (mx - hx) if (mx is not None) else None
+        current_x_step = cal_x.home
+
+        log("Calibrating Y...")
+        hy, my = home_axis_until_switch(STEP_Y_PIN, DIR_Y_PIN, EN_Y_PIN, LIMIT_Y_HOME, search_direction=1, coarse_delay=step_delay)
+        if hy is None:
+            log("Y homing failed.")
+            return False
+        cal_y.home = hy
+        cal_y.max_step = my
+        cal_y.steps_per_unit = (my - hy) if (my is not None) else None
+        current_y_step = cal_y.home
+    return True
+
+# ----------------------
+# Mapping and moves
+# ----------------------
+def norm_to_step_x(x_norm):
+    if cal_x.steps_per_unit is None:
+        raise RuntimeError("X axis not calibrated with known range (no MAX switch).")
+    x = max(0.0, min(1.0, float(x_norm)))
+    return int(cal_x.home + x * cal_x.steps_per_unit)
+
+def norm_to_step_y(y_norm):
+    if cal_y.steps_per_unit is None:
+        raise RuntimeError("Y axis not calibrated with known range (no MAX switch).")
+    y = max(0.0, min(1.0, float(y_norm)))
+    return int(cal_y.home + y * cal_y.steps_per_unit)
+
+def move_to_normalized(x_norm, y_norm, step_delay=DEFAULT_STEP_DELAY):
+    global current_x_step, current_y_step
+    with movement_lock:
+        tx = None
+        ty = None
+        try:
+            tx = norm_to_step_x(x_norm)
+            ty = norm_to_step_y(y_norm)
+        except RuntimeError:
+            # If not calibrated to a range (no MAX), user likely wants incremental moves: use percent of a revolution
+            # For safety, raise
+            raise RuntimeError("Cannot move by normalized coords: axes lack calibrated range (no MAX).")
+        dx = tx - current_x_step
+        dy = ty - current_y_step
+        if dx != 0:
+            dirx = 1 if dx > 0 else -1
+            stepdir_move_steps(STEP_X_PIN, DIR_X_PIN, abs(dx), step_delay=step_delay, direction=dirx, enable_pin=EN_X_PIN)
+            current_x_step = tx
+        if dy != 0:
+            diry = 1 if dy > 0 else -1
+            stepdir_move_steps(STEP_Y_PIN, DIR_Y_PIN, abs(dy), step_delay=step_delay, direction=diry, enable_pin=EN_Y_PIN)
+            current_y_step = ty
+
+# ----------------------
+# CSV load & runner
+# ----------------------
+def load_csv_points(path):
+    pts = []
+    with open(path, newline='') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row: continue
+            try:
+                x = float(row[0].strip())
+                y = float(row[1].strip())
+            except Exception:
+                continue
+            pts.append((x,y))
+    return pts
+
+def run_graph(points, delay_between=0.2, step_delay=DEFAULT_STEP_DELAY):
+    stop_event.clear()
+    for (x,y) in points:
+        if stop_event.is_set() or emergency_pressed():
+            log("Stopped by stop_event or emergency.")
+            break
+        try:
+            move_to_normalized(x, y, step_delay=step_delay)
+        except RuntimeError as e:
+            log("Run aborted:", e)
+            break
+        time.sleep(delay_between)
+    log("Graph run complete.")
+
+# ----------------------
+# Camera thread (OpenCV)
+# ----------------------
+def camera_capture_thread(frame_q, stop_flag):
+    cap = cv2.VideoCapture(CAMERA_DEVICE)
+    if not cap.isOpened():
+        log("Camera open failed")
+        return
+    while not stop_flag.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.05)
+            continue
+        frame_small = cv2.resize(frame, (640, 480))
+        if not frame_q.full():
+            frame_q.put(frame_small)
+        time.sleep(0.03)
+    cap.release()
+
+# ----------------------
+# UI
+# ----------------------
+class AppUI:
+    def __init__(self, root):
+        self.root = root
+        root.title("Turret Graphing (SAFE: no firing)")
+        self.frame_q = queue.Queue(maxsize=2)
+        self.cam_stop = threading.Event()
+        self.cam_thread = threading.Thread(target=camera_capture_thread, args=(self.frame_q, self.cam_stop), daemon=True)
+        self.cam_thread.start()
+
+        btn_frame = tk.Frame(root)
+        btn_frame.pack(side=tk.TOP, fill=tk.X)
+        tk.Button(btn_frame, text="Calibrate (Home)", command=self.calibrate).pack(side=tk.LEFT)
+        tk.Button(btn_frame, text="Load CSV", command=self.load_csv).pack(side=tk.LEFT)
+        tk.Button(btn_frame, text="Run Graph", command=self.run_graph).pack(side=tk.LEFT)
+        tk.Button(btn_frame, text="Stop", command=self.stop_motion).pack(side=tk.LEFT)
+        tk.Button(btn_frame, text="Emergency Stop (HW)", command=self.hw_emergency_info).pack(side=tk.LEFT)
+
+        self.status_var = tk.StringVar(value="Idle")
+        tk.Label(root, textvariable=self.status_var).pack(side=tk.TOP)
+
+        self.canvas = tk.Canvas(root, width=640, height=480)
+        self.canvas.pack()
+
+        self.points = []
+        self.update_ui()
+
+    def set_status(self, s):
+        self.status_var.set(s)
+
+    def calibrate(self):
+        def job():
+            self.set_status("Calibrating...")
+            ok = calibrate_all()
+            self.set_status("Calibrated" if ok else "Calibration failed")
+        threading.Thread(target=job, daemon=True).start()
+
+    def load_csv(self):
+        path = filedialog.askopenfilename(filetypes=[("CSV","*.csv"),("All files","*.*")])
+        if not path: return
+        pts = load_csv_points(path)
+        if not pts:
+            messagebox.showerror("Load CSV","No points found or invalid CSV.")
+            return
+        self.points = pts
+        self.set_status(f"Loaded {len(pts)} points")
+
+    def run_graph(self):
+        if not self.points:
+            messagebox.showwarning("Run Graph","No CSV loaded.")
+            return
+        def job():
+            self.set_status("Running graph...")
+            run_graph(self.points)
+            self.set_status("Done")
+        threading.Thread(target=job, daemon=True).start()
+
+    def stop_motion(self):
+        stop_event.set()
+        self.set_status("Stop requested")
+
+    def hw_emergency_info(self):
+        messagebox.showinfo("Hardware E-Stop", "Ensure the hardware E-Stop physically cuts motor power. Software Stop does not cut power.")
+
+    def update_ui(self):
+        # show camera frames
+        try:
+            frame = self.frame_q.get_nowait()
+            try:
+                from PIL import Image, ImageTk
+                im = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                self.photo = ImageTk.PhotoImage(im)
+                self.canvas.create_image(0,0,anchor=tk.NW, image=self.photo)
+            except Exception:
+                pass
+        except queue.Empty:
+            pass
+        # emergency check
+        if emergency_pressed():
+            self.set_status("EMERGENCY ACTIVE - motors disabled")
+        self.root.after(50, self.update_ui)
+
+# ----------------------
+# Main
+# ----------------------
+def main():
+    root = tk.Tk()
+    app = AppUI(root)
+    try:
+        root.mainloop()
+    finally:
+        stop_event.set()
+        app.cam_stop.set()
+        if EN_X_PIN is not None:
+            gpio_write(EN_X_PIN, 1)
+        if EN_Y_PIN is not None:
+            gpio_write(EN_Y_PIN, 1)
+        if PIGPIO_AVAILABLE:
+            pi.stop()
+        else:
+            GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
