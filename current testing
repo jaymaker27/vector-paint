@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+import RPi.GPIO as GPIO
+import time
+
+# ---------------- CONFIG ----------------
+STEP_X, DIR_X = 23, 24
+STEP_Y, DIR_Y = 20, 21
+LIM_X_MIN = 17  # 0 = not pressed, 1 = pressed
+LIM_Y_MIN = 22
+STEP_PERIOD_US = 8000  # Slower: ~125 steps/sec
+STEP_ON_US = 12
+
+# ---------------- INIT ----------------
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+for pin in [STEP_X, DIR_X, STEP_Y, DIR_Y, LIM_X_MIN, LIM_Y_MIN]:
+    if pin in [LIM_X_MIN, LIM_Y_MIN]:
+        GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+    else:
+        GPIO.setup(pin, GPIO.OUT)
+        GPIO.output(pin, 1 if pin in [STEP_X, STEP_Y] else 0)  # step idle HIGH, dir LOW
+
+# Set directions
+GPIO.output(DIR_X, 1)
+GPIO.output(DIR_Y, 1)
+
+def step(pin, on_us=STEP_ON_US, period_us=STEP_PERIOD_US):
+    GPIO.output(pin, 0)  # active-low pulse
+    time.sleep(on_us / 1_000_000)
+    GPIO.output(pin, 1)
+    time.sleep((period_us - on_us) / 1_000_000)
+
+# ---------------- RUN ----------------
+print("Stepping motors until limit switches are hit...")
+x_done = False
+y_done = False
+
+try:
+    while not (x_done and y_done):
+        if not x_done:
+            if GPIO.input(LIM_X_MIN) == 1:
+                print("X switch hit. Stopping X motor.")
+                x_done = True
+            else:
+                step(STEP_X)
+        if not y_done:
+            if GPIO.input(LIM_Y_MIN) == 1:
+                print("Y switch hit. Stopping Y motor.")
+                y_done = True
+            else:
+                step(STEP_Y)
+finally:
+    GPIO.cleanup()
+    print("Test complete.")
