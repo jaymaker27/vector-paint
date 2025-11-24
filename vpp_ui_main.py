@@ -54,6 +54,10 @@ In vpp_turret_control.py you MAY define any of:
     def goto_forward(): ...
     def set_current_as_forward(): ...
     def request_abort(): ...
+    def start_travel_calibration(): ...
+    def set_current_as_x_max(): ...
+    def set_current_as_y_max(): ...
+    def finish_travel_calibration(): ...
 
 If a function is missing, the UI will just print a message and keep running.
 """
@@ -65,8 +69,10 @@ import random
 import math
 from pathlib import Path
 
+import tkinter as tk
 from tkinter import *
 from tkinter import ttk, messagebox, filedialog
+import cv2
 
 # Pillow for image work / previews
 try:
@@ -75,6 +81,7 @@ except Exception as e:  # pillow not present
     print("WARNING: Pillow (PIL) not available, image functions will be limited:", e, file=sys.stderr)
     Image = None
     ImageTk = None
+    ImageFilter = None
 
 # Picamera2 for live camera view
 try:
@@ -114,7 +121,12 @@ def safe_call(name, *args, **kwargs):
 
 class VPPApp:
     STATUS_INTERVAL = 0.1  # seconds
-    PREDATOR_INTERVAL_MS = 80
+    PREDATOR_INTERVAL_MS = 40
+
+    # Predator motion detection tuning
+    PREDATOR_MOTION_THRESH = 25        # pixel difference threshold (0–255)
+    PREDATOR_MIN_CONTOUR_AREA = 600    # ignore tiny moving specks
+    PREDATOR_LOST_FRAMES = 15          # frames with no motion before sweeping
 
     def __init__(self, root: Tk):
         self.root = root
@@ -137,6 +149,10 @@ class VPPApp:
         self.autofire_var = BooleanVar(value=False)
         self.sentry_var = BooleanVar(value=False)
 
+        # Tracking inversion (used by Tracking / Predator Settings dialog)
+        self.track_invert_x_var = BooleanVar(value=False)
+        self.track_invert_y_var = BooleanVar(value=False)
+
         self.current_image_path = None
         self.current_job = None
 
@@ -146,9 +162,14 @@ class VPPApp:
         self._camera_after_id = None
         self._camera_win = None    # for preview window
         self._camera_label = None
+
+        # Predator / sentry state
         self._predator_prev_gray = None
         self._predator_scan_dir = 1  # +1 right, -1 left
-        self._predator_lock_timer = 0.0
+        self._predator_lock_frames = 0
+        self._predator_shot_cooldown = 0.0
+        self._predator_no_motion_frames = 0  # how long since we last saw motion
+        # Auto-fire is now a global setting (shared with Settings dialog)
 
         # Settings
         self.settings = {
@@ -174,10 +195,33 @@ class VPPApp:
         self.main_frame = Frame(self.root, bg="#050a0f")
         self.main_frame.pack(fill=BOTH, expand=True)
 
-        # Menu bar (only Settings here, rest is sidebar)
         menubar = Menu(self.root, tearoff=False)
         settings_menu = Menu(menubar, tearoff=False)
-        settings_menu.add_command(label="Settings…", command=self.open_settings_dialog)
+        # Motor / control settings
+        settings_menu.add_command(
+            label="Motor / Control Settings…",
+            command=self.open_settings_dialog
+        )
+
+        # Tracking / Predator settings (axis inversion, etc.)
+        settings_menu.add_command(
+            label="Tracking / Predator Settings…",
+            command=self.open_tracking_settings_dialog
+        )
+
+        # Calibration submenu under Settings
+        calib_menu = Menu(settings_menu, tearoff=False)
+
+        calib_menu.add_command(
+            label="Aim / Camera Center…",
+            command=self.open_aim_calibration
+        )
+        calib_menu.add_command(
+            label="Rotation / Travel Calibration…",
+            command=self.open_travel_calibration
+        )
+        settings_menu.add_cascade(label="Calibration", menu=calib_menu)
+
         menubar.add_cascade(label="Settings", menu=settings_menu)
         self.root.config(menu=menubar)
 
@@ -917,6 +961,7 @@ class VPPApp:
             fg="#00ffcc", bg="#050a0f", pady=6
         ).pack()
 
+        # Fixed palette: each entry is (name, hex_color)
         palette = [
             ("Red", "#ff3333"),
             ("Orange", "#ff8800"),
@@ -946,16 +991,19 @@ class VPPApp:
                 width=14, anchor="w"
             ).pack(side=LEFT)
 
+            # StringVar that stores the chosen color for this pass
             var = StringVar(value=p.get("color", "#00ffcc"))
             color_vars.append(var)
 
+            # Little preview swatch
             preview = Label(row, text="  ", bg=var.get(), width=4, relief=FLAT)
             preview.pack(side=LEFT, padx=(4, 8))
 
-            def make_handler(v=var, preview_label=preview):
-                def set_color(hex_color):
-                    v.set(hex_color)
-                    preview_label.configure(bg=hex_color)
+            # Each palette button calls a handler that sets this pass's color
+            def make_handler(color, v=var, preview_label=preview):
+                def set_color():
+                    v.set(color)
+                    preview_label.configure(bg=color)
                 return set_color
 
             for _, hex_color in palette:
@@ -972,11 +1020,13 @@ class VPPApp:
         br.pack(pady=(8, 10))
 
         def on_ok():
+            # Copy chosen colors back into the job structure
             for p, var in zip(passes, color_vars):
                 p["color"] = var.get()
             job["_colors_configured"] = True
             win.grab_release()
             win.destroy()
+            # Re-run the simulation with chosen colors, then confirm
             self._simulate_paint_job(job)
             self._confirm_and_run_job(job)
 
@@ -1046,18 +1096,21 @@ class VPPApp:
         threading.Thread(target=worker, daemon=True).start()
 
     # -----------------------------------------------------------------
-    # SETTINGS DIALOG + AIM CALIBRATION
     # -----------------------------------------------------------------
-
+    # SETTINGS DIALOG + CALIBRATION
+    # -----------------------------------------------------------------
+    # -----------------------------------------------------------------
+    # SETTINGS DIALOG – MOTOR / JOG / AUTO-FIRE ONLY
+    # -----------------------------------------------------------------
     def open_settings_dialog(self):
-        """Main Settings dialog: motor speeds, manual jog, and calibration tools."""
+        """Main Settings dialog: motor speeds, manual jog, and auto-fire."""
         win = Toplevel(self.root)
         win.title("VPP Settings")
         win.configure(bg="#050a0f")
         win.transient(self.root)
         win.grab_set()
 
-        # Title
+        # ---------------- Title ----------------
         Label(
             win,
             text="Motor & Control Settings",
@@ -1175,23 +1228,30 @@ class VPPApp:
             relief=FLAT
         ).grid(row=3, column=1, pady=(6, 2))
 
-        # ---------------- Calibration tools ----------------
+        # ---------------- Global auto-fire setting ----------------
         Label(
             win,
-            text="Calibration Tools",
+            text="Auto-fire",
             font=("Segoe UI", 11, "bold"),
             fg="#00ffcc", bg="#050a0f",
             pady=4
         ).pack()
 
-        Button(
-            win,
-            text="Aim / Camera Center Calibration…",
-            command=self.open_aim_calibration,
-            font=("Segoe UI", 10, "bold"),
-            bg="#00ffcc", fg="#002222",
-            relief=FLAT, padx=10, pady=4
-        ).pack(pady=(0, 8))
+        af_frame = Frame(win, bg="#050a0f")
+        af_frame.pack(padx=10, pady=(0, 8), fill=X)
+
+        Checkbutton(
+            af_frame,
+            text="Enable auto-fire when target locked",
+            variable=self.autofire_var,
+            command=self.on_toggle_autofire,
+            font=("Segoe UI", 10),
+            fg="#e0ffff",
+            bg="#050a0f",
+            activebackground="#050a0f",
+            selectcolor="#330000",
+            anchor="w"
+        ).pack(anchor="w")
 
         # ---------------- Close button ----------------
         Button(
@@ -1200,7 +1260,102 @@ class VPPApp:
             font=("Segoe UI", 10),
             bg="#333333", fg="#eeeeee",
             relief=FLAT, padx=12, pady=4
-        ).pack(pady=(0, 8))
+        ).pack(pady=(4, 8))
+
+    def open_tracking_settings_dialog(self):
+        """Settings dialog: flip Predator tracking directions per axis."""
+        win = Toplevel(self.root)
+        win.title("Tracking / Predator Settings")
+        win.configure(bg="#050a0f")
+        win.transient(self.root)
+        win.grab_set()
+
+        Label(
+            win,
+            text="Predator Tracking Direction",
+            font=("Segoe UI", 13, "bold"),
+            fg="#00ffcc", bg="#050a0f",
+            pady=6
+        ).pack()
+
+        Label(
+            win,
+            text=(
+                "If the turret moves the wrong way when tracking a target,\n"
+                "you can flip the axes here. These only affect Predator mode."
+            ),
+            font=("Segoe UI", 9),
+            fg="#a8ffff", bg="#050a0f",
+            justify="left"
+        ).pack(padx=10, pady=(0, 8))
+
+        frame = Frame(win, bg="#050a0f")
+        frame.pack(padx=10, pady=(0, 8), fill=X)
+
+        Checkbutton(
+            frame,
+            text="Invert X axis (left/right)",
+            variable=self.track_invert_x_var,
+            font=("Segoe UI", 10),
+            fg="#e0ffff", bg="#050a0f",
+            activebackground="#050a0f",
+            selectcolor="#003333",
+            anchor="w"
+        ).pack(anchor="w", pady=2)
+
+        Checkbutton(
+            frame,
+            text="Invert Y axis (up/down)",
+            variable=self.track_invert_y_var,
+            font=("Segoe UI", 10),
+            fg="#e0ffff", bg="#050a0f",
+            activebackground="#050a0f",
+            selectcolor="#003333",
+            anchor="w"
+        ).pack(anchor="w", pady=2)
+
+        def on_save():
+            invert_x = bool(self.track_invert_x_var.get())
+            invert_y = bool(self.track_invert_y_var.get())
+            # Tell backend to update TRACK_INVERT_X / TRACK_INVERT_Y
+            safe_call("set_tracking_inversion", invert_x=invert_x, invert_y=invert_y)
+            messagebox.showinfo(
+                "Tracking settings saved",
+                "Tracking inversion updated for Predator mode."
+            )
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+
+        def on_close():
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+
+        btn_frame = Frame(win, bg="#050a0f")
+        btn_frame.pack(pady=(4, 8))
+
+        Button(
+            btn_frame,
+            text="Save",
+            command=on_save,
+            font=("Segoe UI", 10, "bold"),
+            bg="#00ffcc", fg="#002222",
+            relief=FLAT, padx=12, pady=4
+        ).pack(side=LEFT, padx=6)
+
+        Button(
+            btn_frame,
+            text="Close",
+            command=on_close,
+            font=("Segoe UI", 10),
+            bg="#333333", fg="#eeeeee",
+            relief=FLAT, padx=12, pady=4
+        ).pack(side=LEFT, padx=6)
 
     def open_aim_calibration(self):
         """Dedicated window for aim / camera-center calibration."""
@@ -1216,7 +1371,7 @@ class VPPApp:
             text="Aim / Center Calibration",
             font=("Segoe UI", 13, "bold"),
             fg="#00ffcc", bg="#050a0f",
-            pady=6
+            pady=4
         ).pack()
 
         Label(
@@ -1230,7 +1385,7 @@ class VPPApp:
             font=("Segoe UI", 9),
             fg="#a8ffff", bg="#050a0f",
             justify="left"
-        ).pack(padx=10, pady=(0, 6))
+        ).pack(padx=10, pady=(0, 4))
 
         # Row 1: camera preview + home / center buttons
         row1 = Frame(win, bg="#050a0f")
@@ -1242,7 +1397,7 @@ class VPPApp:
             command=self.open_camera_preview,
             font=("Segoe UI", 10, "bold"),
             bg="#00bbee", fg="#002222",
-            relief=FLAT, padx=10, pady=4
+            relief=FLAT, padx=8, pady=3
         ).pack(side=LEFT, padx=4)
 
         def do_home():
@@ -1263,7 +1418,7 @@ class VPPApp:
             command=do_home,
             font=("Segoe UI", 10, "bold"),
             bg="#00ffcc", fg="#002222",
-            relief=FLAT, padx=10, pady=4
+            relief=FLAT, padx=8, pady=3
         ).pack(side=LEFT, padx=4)
 
         Button(
@@ -1272,7 +1427,7 @@ class VPPApp:
             command=do_goto_center,
             font=("Segoe UI", 10, "bold"),
             bg="#0088cc", fg="#e0ffff",
-            relief=FLAT, padx=10, pady=4
+            relief=FLAT, padx=8, pady=3
         ).pack(side=LEFT, padx=4)
 
         # Row 2: jog + fire
@@ -1281,10 +1436,10 @@ class VPPApp:
             text="Step 3: Fine-tune aim and test fire:",
             font=("Segoe UI", 9, "bold"),
             fg="#e0ffff", bg="#050a0f"
-        ).pack(padx=10, pady=(6, 2))
+        ).pack(padx=10, pady=(4, 2))
 
         jf = Frame(win, bg="#050a0f")
-        jf.pack(padx=10, pady=(0, 6))
+        jf.pack(padx=10, pady=(0, 4))
 
         def jog(axis, direction):
             step_deg = self.settings["jog_step_deg"]
@@ -1297,7 +1452,7 @@ class VPPApp:
             font=("Segoe UI", 10, "bold"),
             bg="#00ffcc", fg="#002222",
             relief=FLAT
-        ).grid(row=0, column=1, pady=2)
+        ).grid(row=0, column=1, pady=1)
 
         Button(
             jf, text="X-", width=5,
@@ -1305,7 +1460,7 @@ class VPPApp:
             font=("Segoe UI", 10, "bold"),
             bg="#00ffcc", fg="#002222",
             relief=FLAT
-        ).grid(row=1, column=0, padx=4, pady=2)
+        ).grid(row=1, column=0, padx=3, pady=1)
 
         Button(
             jf, text="X+", width=5,
@@ -1313,7 +1468,7 @@ class VPPApp:
             font=("Segoe UI", 10, "bold"),
             bg="#00ffcc", fg="#002222",
             relief=FLAT
-        ).grid(row=1, column=2, padx=4, pady=2)
+        ).grid(row=1, column=2, padx=3, pady=1)
 
         Button(
             jf, text="Y-", width=5,
@@ -1321,19 +1476,19 @@ class VPPApp:
             font=("Segoe UI", 10, "bold"),
             bg="#00ffcc", fg="#002222",
             relief=FLAT
-        ).grid(row=2, column=1, pady=2)
+        ).grid(row=2, column=1, pady=1)
 
         Button(
-            jf, text="Test Fire", width=10,
+            jf, text="Test Fire", width=9,
             command=lambda: safe_call("manual_fire"),
             font=("Segoe UI", 10, "bold"),
             bg="#ff8800", fg="#221100",
             relief=FLAT
-        ).grid(row=1, column=1, padx=4, pady=2)
+        ).grid(row=1, column=1, padx=3, pady=1)
 
         # Row 3: save + close
         row3 = Frame(win, bg="#050a0f")
-        row3.pack(padx=10, pady=(6, 8))
+        row3.pack(padx=10, pady=(4, 6))
 
         Button(
             row3,
@@ -1341,7 +1496,7 @@ class VPPApp:
             command=lambda: safe_call("set_current_as_forward"),
             font=("Segoe UI", 10, "bold"),
             bg="#ffaa33", fg="#221100",
-            relief=FLAT, padx=10, pady=4
+            relief=FLAT, padx=8, pady=3
         ).pack(side=LEFT, padx=4)
 
         Button(
@@ -1350,7 +1505,157 @@ class VPPApp:
             command=lambda: (win.grab_release(), win.destroy()),
             font=("Segoe UI", 10),
             bg="#333333", fg="#eeeeee",
-            relief=FLAT, padx=10, pady=4
+            relief=FLAT, padx=8, pady=3
+        ).pack(side=LEFT, padx=4)
+
+    def open_travel_calibration(self):
+        """
+        Rotation / Travel Calibration dialog.
+
+        Uses backend:
+          - begin_travel_calibration()
+          - finalize_travel_calibration()
+        which you already have implemented.
+        """
+        win = Toplevel(self.root)
+        win.title("Rotation / Travel Calibration")
+        win.configure(bg="#050a0f")
+        win.transient(self.root)
+        win.grab_set()
+
+        # Title & instructions
+        Label(
+            win,
+            text="Rotation / Travel Calibration",
+            font=("Segoe UI", 13, "bold"),
+            fg="#00ffcc", bg="#050a0f",
+            pady=4
+        ).pack()
+
+        Label(
+            win,
+            text=(
+                "Step 1: Home & unlock soft limits.\n"
+                "Step 2: Jog to the FARTHEST SAFE angles (do NOT hit hard stops).\n"
+                "Step 3: Save current position as the max travel for each axis.\n\n"
+                "You can rerun this any time to change the travel bounds."
+            ),
+            font=("Segoe UI", 9),
+            fg="#a8ffff", bg="#050a0f",
+            justify="left"
+        ).pack(padx=10, pady=(0, 4))
+
+        # --- Step 1: home + clear max ---
+        row1 = Frame(win, bg="#050a0f")
+        row1.pack(padx=10, pady=(4, 4), fill=X)
+
+        start_btn = Button(
+            row1,
+            text="1) Home & Unlock Travel",
+            font=("Segoe UI", 10, "bold"),
+            bg="#00ffcc", fg="#002222",
+            relief=FLAT, padx=8, pady=3
+        )
+        start_btn.pack(side=LEFT, padx=4)
+
+        def do_start_calibration():
+            def worker():
+                start_btn.configure(state=DISABLED, text="Homing + unlocking…")
+                safe_call("begin_travel_calibration")
+                start_btn.configure(state=NORMAL, text="1) Home & Unlock Travel")
+                messagebox.showinfo(
+                    "Travel calibration",
+                    "Homing complete and soft max cleared.\n\n"
+                    "Now use the jog controls to move to the furthest SAFE angles,\n"
+                    "then press '3) Save Soft Limits'."
+                )
+            threading.Thread(target=worker, daemon=True).start()
+
+        start_btn.configure(command=do_start_calibration)
+
+        # --- Step 2: jog cluster ---
+        Label(
+            win,
+            text="Step 2: Jog to furthest SAFE angles (do not hit hard stops):",
+            font=("Segoe UI", 9, "bold"),
+            fg="#e0ffff", bg="#050a0f"
+        ).pack(padx=10, pady=(4, 2))
+
+        jf = Frame(win, bg="#050a0f")
+        jf.pack(padx=10, pady=(0, 4))
+
+        def jog(axis, direction):
+            step_deg = self.settings["jog_step_deg"]
+            speed = self.settings["x_speed"] if axis.upper() == "X" else self.settings["y_speed"]
+            safe_call("jog", axis.upper(), direction, step_deg, speed)
+
+        Button(
+            jf, text="Y+", width=6,
+            command=lambda: jog("Y", +1),
+            font=("Segoe UI", 10, "bold"),
+            bg="#00ffcc", fg="#002222",
+            relief=FLAT
+        ).grid(row=0, column=1, pady=1)
+
+        Button(
+            jf, text="X-", width=6,
+            command=lambda: jog("X", -1),
+            font=("Segoe UI", 10, "bold"),
+            bg="#00ffcc", fg="#002222",
+            relief=FLAT
+        ).grid(row=1, column=0, padx=3, pady=1)
+
+        Button(
+            jf, text="X+", width=6,
+            command=lambda: jog("X", +1),
+            font=("Segoe UI", 10, "bold"),
+            bg="#00ffcc", fg="#002222",
+            relief=FLAT
+        ).grid(row=1, column=2, padx=3, pady=1)
+
+        Button(
+            jf, text="Y-", width=6,
+            command=lambda: jog("Y", -1),
+            font=("Segoe UI", 10, "bold"),
+            bg="#00ffcc", fg="#002222",
+            relief=FLAT
+        ).grid(row=2, column=1, pady=1)
+
+        # --- Step 3: save soft limits ---
+        row3 = Frame(win, bg="#050a0f")
+        row3.pack(padx=10, pady=(4, 6), fill=X)
+
+        save_btn = Button(
+            row3,
+            text="3) Save Soft Limits",
+            font=("Segoe UI", 10, "bold"),
+            bg="#ffaa33", fg="#221100",
+            relief=FLAT, padx=8, pady=3
+        )
+        save_btn.pack(side=LEFT, padx=4)
+
+        def do_save_limits():
+            def worker():
+                save_btn.configure(state=DISABLED, text="Saving limits…")
+                safe_call("finalize_travel_calibration")
+                save_btn.configure(state=NORMAL, text="3) Save Soft Limits")
+                messagebox.showinfo(
+                    "Soft limits saved",
+                    "Soft travel limits saved.\n\n"
+                    "All jogs / scans / paint moves will now be clamped to these\n"
+                    "bounds until you rerun travel calibration."
+                )
+            threading.Thread(target=worker, daemon=True).start()
+
+        save_btn.configure(command=do_save_limits)
+
+        Button(
+            row3,
+            text="Close",
+            command=lambda: (win.grab_release(), win.destroy()),
+            font=("Segoe UI", 10),
+            bg="#333333", fg="#eeeeee",
+            relief=FLAT, padx=8, pady=3
         ).pack(side=LEFT, padx=4)
 
     # -----------------------------------------------------------------
@@ -1458,198 +1763,411 @@ class VPPApp:
         enabled = not self.sentry_var.get()
         self.sentry_var.set(enabled)
         if enabled:
+            self.sentry_btn.configure(
+                text="Predator Sentry: ON",
+                bg="#aa0000",
+                fg="#ffeeee",
+                activebackground="#dd0000",
+                activeforeground="#ffffff",
+            )
             self._start_predator_mode()
         else:
+            self.sentry_btn.configure(
+                text="Predator Sentry: OFF",
+                bg="#550000",
+                fg="#ffeeee",
+                activebackground="#aa0000",
+                activeforeground="#ffffff",
+            )
             self._stop_predator_mode()
 
     def _start_predator_mode(self):
-        self.close_camera_preview()  # one camera mode at a time
+        """Open Predator Sentry Mode window and start tracking loop."""
+        if getattr(self, "_predator_window", None) is not None:
+            try:
+                self._predator_window.lift()
+                self._predator_window.focus_force()
+                return
+            except tk.TclError:
+                self._predator_window = None
+
+        # State flags
+        self._predator_enabled = True
+        self._predator_scan_dir = 1
+        self._predator_last_target = None
+        self._predator_prev_gray = None
+        self._predator_lock_frames = 0
+        self._predator_shot_cooldown = 0.0
+        self._predator_no_motion_frames = 0
+
+        # Mark camera mode so we don't open a second preview
+        self._camera_mode = "predator"
+
+        # Ensure backend in tracking/sentry mode,
+        # and sync auto-fire with the global setting
+        safe_call("set_tracking_enabled", True)
+        safe_call("set_sentry_mode", True)
+        safe_call("set_autofire_enabled", bool(self.autofire_var.get()))
+
+        # Build Predator window
+        self._predator_window = tk.Toplevel(self.root)
+        self._predator_window.title("Predator Sentry Mode")
+        self._predator_window.configure(bg="#050510")
+        self._predator_window.geometry("720x560+80+80")
+
+        # Make sure it appears on top of the fullscreen main window
+        try:
+            self._predator_window.transient(self.root)
+            self._predator_window.grab_set()
+        except Exception:
+            pass
+        self._predator_window.lift()
+        self._predator_window.focus_force()
+
+        self._predator_window.protocol(
+            "WM_DELETE_WINDOW", self._on_predator_window_close
+        )
+
+        title_lbl = tk.Label(
+            self._predator_window,
+            text="PREDATOR SENTRY MODE",
+            font=("Consolas", 20, "bold"),
+            fg="#00ffcc",
+            bg="#050510",
+        )
+        title_lbl.pack(pady=(10, 4))
+
+        hint_lbl = tk.Label(
+            self._predator_window,
+            text="Bright target in FOV → scan, track, and auto-fire when locked (if AUTO-FIRE is enabled in Settings).",
+            font=("Consolas", 11),
+            fg="#8888ff",
+            bg="#050510",
+        )
+        hint_lbl.pack(pady=(0, 8))
+
+        # Canvas for camera + HUD overlay
+        self._predator_overlay_canvas = tk.Canvas(
+            self._predator_window,
+            width=640,
+            height=480,
+            highlightthickness=0,
+            bg="#000000",
+        )
+        self._predator_overlay_canvas.pack(fill="both", expand=True)
+
+        # Start loop using the shared camera
+        self._predator_timer = self.root.after(
+            self.PREDATOR_INTERVAL_MS, self._predator_loop
+        )
+
+    def _update_predator_autofire_button(self):
+        """Refresh the AUTO-FIRE button label/colors from UI state."""
+        if not hasattr(self, "_predator_autofire_btn") or self._predator_autofire_btn is None:
+            return
+
+        if getattr(self, "_predator_autofire_ui_enabled", False):
+            # ARMED
+            self._predator_autofire_btn.configure(
+                text="AUTO-FIRE: ARMED",
+                fg="#00ff88",
+                bg="#330000",
+                activebackground="#550000",
+                activeforeground="#00ff88",
+            )
+        else:
+            # SAFE
+            self._predator_autofire_btn.configure(
+                text="AUTO-FIRE: SAFE",
+                fg="#ffaa00",
+                bg="#001010",
+                activebackground="#002020",
+                activeforeground="#ffaa00",
+            )
+
+    def _toggle_predator_autofire(self):
+        """Toggle Predator window AUTO-FIRE SAFE/ARMED."""
+        self._predator_autofire_ui_enabled = not getattr(
+            self, "_predator_autofire_ui_enabled", False
+        )
+        self._update_predator_autofire_button()
+        state = "ARMED" if self._predator_autofire_ui_enabled else "SAFE"
+        print(f"UI Predator: AUTO-FIRE now {state}")
+
+    # ---------------- PREDATOR CAMERA HELPERS ----------------
+
+    def _capture_predator_frame(self):
+        """
+        Grab a single frame for Predator mode, reusing the same Picamera2
+        instance as the normal camera preview.
+        """
         cam = self._ensure_camera()
         if cam is None:
-            self.sentry_var.set(False)
-            messagebox.showerror(
-                "Camera error",
-                "Could not open turret camera for Predator Sentry Mode.\n\n"
-                "Make sure Picamera2 is installed and the camera is enabled."
-            )
+            # Avoid spamming message boxes; just log
+            print("UI Predator: camera not available for capture")
+            return None
+
+        try:
+            frame = cam.capture_array()
+            return frame
+        except Exception as e:
+            print("UI Predator: capture error:", e, file=sys.stderr)
+            return None
+
+    def _process_predator_frame(self, frame):
+        """
+        Motion-based target detection:
+
+        - Convert to grayscale and blur slightly
+        - Compare to previous frame (frame differencing)
+        - Threshold to find moving regions
+        - Choose largest moving contour
+        - Return normalized centroid (x_norm, y_norm) in [0..1] or None.
+        """
+        if frame is None:
+            return None
+
+        # Handle XBGR8888 → BGR
+        if len(frame.shape) == 3 and frame.shape[2] == 4:
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        else:
+            frame_bgr = frame
+
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        # First frame: store baseline and don't report any motion yet
+        if self._predator_prev_gray is None:
+            self._predator_prev_gray = gray
+            self._predator_last_target = None
+            return None
+
+        # Frame differencing
+        frame_delta = cv2.absdiff(self._predator_prev_gray, gray)
+        self._predator_prev_gray = gray
+
+        # Threshold differences to get a motion mask
+        _, motion_mask = cv2.threshold(
+            frame_delta,
+            self.PREDATOR_MOTION_THRESH,
+            255,
+            cv2.THRESH_BINARY,
+        )
+        motion_mask = cv2.dilate(motion_mask, None, iterations=2)
+
+        contours, _ = cv2.findContours(
+            motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            self._predator_last_target = None
+            return None
+
+        # Find largest moving blob
+        best = None
+        best_area = 0.0
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < self.PREDATOR_MIN_CONTOUR_AREA:
+                continue
+            if area > best_area:
+                best_area = area
+                best = c
+
+        if best is None:
+            self._predator_last_target = None
+            return None
+
+        x, y, w, h = cv2.boundingRect(best)
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+
+        frame_h, frame_w = gray.shape[:2]
+        x_norm = cx / float(frame_w)
+        y_norm = cy / float(frame_h)
+
+        self._predator_last_target = (x_norm, y_norm)
+        return self._predator_last_target
+
+    def _update_predator_overlay(self, frame, target):
+        """Draw camera frame + HUD (crosshair + target marker) onto canvas."""
+        if (
+            not hasattr(self, "_predator_overlay_canvas")
+            or self._predator_overlay_canvas is None
+        ):
+            return
+        if frame is None:
             return
 
-        self._camera_mode = "predator"
-        self._predator_prev_gray = None
-        self._predator_scan_dir = 1
-        self._predator_lock_timer = 0.0
+        # If Pillow is not available, skip drawing overlay but keep logic running
+        if Image is None or ImageTk is None:
+            return
 
-        self.sentry_btn.configure(
-            text="Predator Sentry: ON",
-            bg="#006622"
-        )
+        # Convert to RGB for Tk
+        if len(frame.shape) == 3 and frame.shape[2] == 4:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+        else:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # Automatically enable tracking + autofire when Predator mode starts
-        try:
-            self.tracking_var.set(True)
-            self.autofire_var.set(True)
-        except Exception:
-            pass
+        img = Image.fromarray(frame_rgb)
+        self._predator_photo = ImageTk.PhotoImage(img)
 
-        safe_call("set_tracking_enabled", True)
-        safe_call("set_autofire_enabled", True)
-        safe_call("set_sentry_mode", True)
+        c = self._predator_overlay_canvas
+        c.delete("all")
+        c.create_image(0, 0, image=self._predator_photo, anchor="nw")
 
-        self._predator_loop()
+        w = img.width
+        h = img.height
+        cx = w // 2
+        cy = h // 2
 
-    def _stop_predator_mode(self):
-        self._camera_mode = "off"
-        if self._camera_after_id is not None:
-            try:
-                self.root.after_cancel(self._camera_after_id)
-            except Exception:
-                pass
-            self._camera_after_id = None
+        # Neon center crosshair
+        c.create_line(cx - 20, cy, cx + 20, cy, fill="#00ff88", width=1)
+        c.create_line(cx, cy - 20, cx, cy + 20, fill="#00ff88", width=1)
 
-        self.sentry_btn.configure(
-            text="Predator Sentry: OFF",
-            bg="#550000"
-        )
+        # Show target marker if present
+        if target is not None:
+            tx = int(target[0] * w)
+            ty = int(target[1] * h)
+            r = 18
+            c.create_oval(
+                tx - r,
+                ty - r,
+                tx + r,
+                ty + r,
+                outline="#ff4444",
+                width=2,
+            )
 
-        # Turn off autofire when leaving Predator mode
-        try:
-            self.autofire_var.set(False)
-        except Exception:
-            pass
-        safe_call("set_autofire_enabled", False)
-        safe_call("set_sentry_mode", False)
-
-        self.redraw_scene()
+    # ---------------- PREDATOR MAIN LOOP ----------------
 
     def _predator_loop(self):
-        if self._camera_mode != "predator" or self.picam is None:
+        """Periodic predator-mode scan/track/fire loop."""
+        if not getattr(self, "_predator_enabled", False):
             return
 
-        try:
-            frame = self.picam.capture_array()
-        except Exception as e:
-            print("Predator capture error:", e, file=sys.stderr)
+        # If window died, stop
+        if (
+            self._predator_window is None
+            or not self._predator_window.winfo_exists()
+        ):
             self._stop_predator_mode()
             return
 
-        h, w, _ = frame.shape
-        # Simple luminance
-        gray = (0.299 * frame[:, :, 0] +
-                0.587 * frame[:, :, 1] +
-                0.114 * frame[:, :, 2])
-
-        # Sweep motion: tell backend to scan a bit each tick
-        # Sweep motion: tell backend to scan a bit each tick
-
-        # 1) Update lock timer (how long we "stick" to a target once found)
-        if self._predator_lock_timer > 0.0:
-            self._predator_lock_timer -= self.PREDATOR_INTERVAL_MS / 1000.0
-            if self._predator_lock_timer < 0.0:
-                self._predator_lock_timer = 0.0
-
-        target = None
-        best_score = 0.0
-
-        # 2) Motion-based "target" detection using frame-to-frame difference
-        if self._predator_prev_gray is not None:
-            try:
-                delta = abs(gray - self._predator_prev_gray)
-                # Coarse grid over the frame
-                grid_w, grid_h = 12, 8
-                cell_w = max(1, int(w / grid_w))
-                cell_h = max(1, int(h / grid_h))
-                for gy in range(grid_h):
-                    ys = gy * cell_h
-                    ye = h if gy == grid_h - 1 else (gy + 1) * cell_h
-                    for gx in range(grid_w):
-                        xs = gx * cell_w
-                        xe = w if gx == grid_w - 1 else (gx + 1) * cell_w
-                        cell = delta[ys:ye, xs:xe]
-                        if cell.size == 0:
-                            continue
-                        score = float(cell.mean())
-                        if score > best_score:
-                            best_score = score
-                            cx = (xs + xe) / 2.0
-                            cy = (ys + ye) / 2.0
-                            target = (cx / w, cy / h)
-            except Exception as e:
-                print("Predator motion analysis error:", e, file=sys.stderr)
-                target = None
-                best_score = 0.0
-
-        # Save current frame as previous for next iteration
-        self._predator_prev_gray = gray
-
-        # Threshold for "real" motion; tune as needed
-        MOTION_THRESHOLD = 12.0
-        if best_score < MOTION_THRESHOLD:
-            target = None
-
-        # 3) Sweep motion (only if we are not "locked" to a target)
-        if target is None and self._predator_lock_timer <= 0.0:
-            safe_call("sentry_scan_step", self._predator_scan_dir)
-            # Occasionally flip direction so we don't drift forever
-            if random.random() < 0.02:
-                self._predator_scan_dir *= -1
-        elif target is not None:
-            # We have a candidate target → extend lock timer
-            self._predator_lock_timer = max(self._predator_lock_timer, 0.5)
-
-        # 4) Draw camera frame + HUD on the main canvas
-        self.canvas.delete("all")
-
-        if Image is not None and ImageTk is not None:
-            try:
-                img = Image.fromarray(frame)
-                img = img.resize((self.canvas_w, self.canvas_h))
-                photo = ImageTk.PhotoImage(img)
-                self.canvas.create_image(0, 0, image=photo, anchor="nw")
-                # Keep a reference so Tk doesn't garbage-collect it
-                self.canvas.image = photo
-            except Exception as e:
-                print("Predator image draw error:", e, file=sys.stderr)
-                # fallback background
-                self.canvas.create_rectangle(
-                    0, 0, self.canvas_w, self.canvas_h,
-                    fill="#000000", outline=""
-                )
+        # 1) Grab frame + detect target
+        frame = self._capture_predator_frame()
+        target = self._process_predator_frame(frame)
+        self._update_predator_overlay(frame, target)
+        # Track how long we've gone with / without motion
+        if target is None:
+            self._predator_no_motion_frames += 1
         else:
-            # No Pillow: just black background
-            self.canvas.create_rectangle(
-                0, 0, self.canvas_w, self.canvas_h,
-                fill="#000000", outline=""
+            self._predator_no_motion_frames = 0
+
+        # 2) Update shot cooldown
+        if self._predator_shot_cooldown > 0.0:
+            self._predator_shot_cooldown -= self.PREDATOR_INTERVAL_MS / 1000.0
+            if self._predator_shot_cooldown < 0.0:
+                self._predator_shot_cooldown = 0.0
+
+        # 3) Lock evaluation
+        locked = False
+        if target is not None:
+            cx_norm = 0.5
+            cy_norm = 0.5
+            # ~12% of frame around center counts as "locked"
+            LOCK_TOL = 0.12
+            dx = float(target[0]) - cx_norm
+            dy = float(target[1]) - cy_norm
+            if abs(dx) < LOCK_TOL and abs(dy) < LOCK_TOL:
+                self._predator_lock_frames += 1
+            else:
+                self._predator_lock_frames = 0
+        else:
+            self._predator_lock_frames = 0
+
+        if self._predator_lock_frames >= 1 and target is not None:
+            locked = True
+            print(
+                f"UI Predator: target LOCKED (frames={self._predator_lock_frames}) "
+                f"at ({target[0]:.3f}, {target[1]:.3f})"
             )
 
-        # HUD crosshair at frame center
-        cx = self.canvas_w // 2
-        cy = self.canvas_h // 2
-        self.canvas.create_line(cx - 40, cy, cx + 40, cy, fill="#00ffcc")
-        self.canvas.create_line(cx, cy - 40, cx, cy + 40, fill="#00ffcc")
-        self.canvas.create_oval(
-            cx - 6, cy - 6, cx + 6, cy + 6,
-            outline="#00ffcc"
+        # 4) Decide whether to fire
+        ui_armed = bool(self.autofire_var.get())
+        should_fire = (
+            locked
+            and ui_armed
+            and self._predator_shot_cooldown <= 0.0
         )
 
-        # 5) Draw target box overlay (if any)
-        if target is not None:
-            tx = int(target[0] * self.canvas_w)
-            ty = int(target[1] * self.canvas_h)
-            size = 30
-            self.canvas.create_rectangle(
-                tx - size, ty - size,
-                tx + size, ty + size,
-                outline="#ff4444", width=2
-            )
-            self.canvas.create_line(tx - size, ty, tx + size, ty, fill="#ff4444")
-            self.canvas.create_line(tx, ty - size, tx, ty + size, fill="#ff4444")
-
-            # 6) Ask backend to fire at this normalized coordinate
+        # Always aim at the moving target in SAFE mode (no auto-fire)
+        if target is not None and not ui_armed:
+            # Backend will track but will not fire because auto-fire is off
             safe_call("sentry_fire_at", float(target[0]), float(target[1]))
 
-        # 7) Schedule next predator frame
-        self._camera_after_id = self.root.after(self.PREDATOR_INTERVAL_MS, self._predator_loop)
+        if should_fire and target is not None:
+            print(f"UI Predator: FIRING at target ({target[0]}, {target[1]})")
+            safe_call("sentry_fire_at", float(target[0]), float(target[1]))
+            self._predator_shot_cooldown = 0.3  # seconds between shots
+        elif locked and (not ui_armed) and target is not None:
+            print(
+                f"UI Predator: target locked at ({target[0]:.3f}, {target[1]:.3f}) "
+                f"but AUTO-FIRE: DISABLED"
+            )
 
+        # 5) Sweep when we haven't seen motion for a while
+        if target is None and self._predator_no_motion_frames >= self.PREDATOR_LOST_FRAMES:
+            safe_call("sentry_scan_step", self._predator_scan_dir)
+            self._predator_no_motion_frames = 0
+
+        # Re-arm timer
+        if self._predator_enabled:
+            self._predator_timer = self.root.after(
+                self.PREDATOR_INTERVAL_MS, self._predator_loop
+            )
+
+    # ---------------- PREDATOR CLEANUP ----------------
+
+    def _stop_predator_mode(self):
+        """Stop predator sentry mode and clean up."""
+        self._predator_enabled = False
+        # Allow normal camera preview again
+        self._camera_mode = "off"
+
+        # Cancel loop
+        if getattr(self, "_predator_timer", None) is not None:
+            try:
+                self.root.after_cancel(self._predator_timer)
+            except Exception:
+                pass
+            self._predator_timer = None
+
+        # Tell backend to stop sentry/tracking/autofire
+        safe_call("set_sentry_mode", False)
+        safe_call("set_tracking_enabled", False)
+        safe_call("set_autofire_enabled", False)
+
+        # Destroy Predator window if still around
+        if getattr(self, "_predator_window", None) is not None:
+            try:
+                if self._predator_window.winfo_exists():
+                    self._predator_window.destroy()
+            except Exception:
+                pass
+            self._predator_window = None
+
+    def _on_predator_window_close(self):
+        """Handle user closing the Predator window via the title-bar X."""
+        # Reset sidebar toggle to OFF visually and logically
+        self.sentry_var.set(False)
+        self.sentry_btn.configure(
+            text="Predator Sentry: OFF",
+            bg="#550000",
+            fg="#ffeeee",
+            activebackground="#aa0000",
+            activeforeground="#ffffff",
+        )
+        self._stop_predator_mode()
     # -----------------------------------------------------------------
     # STATUS POLLING / TOP BAR
     # -----------------------------------------------------------------
@@ -1744,8 +2262,10 @@ class VPPApp:
         safe_call("set_tracking_enabled", bool(enabled))
 
     def on_toggle_autofire(self):
-        enabled = self.autofire_var.get()
-        safe_call("set_autofire_enabled", bool(enabled))
+        """Global auto-fire toggle (sidebar + Settings share this)."""
+        enabled = bool(self.autofire_var.get())
+        safe_call("set_autofire_enabled", enabled)
+        print(f"UI: AUTO-FIRE {'ENABLED' if enabled else 'DISABLED'}")
 
     # -----------------------------------------------------------------
     # CLEANUP / QUIT

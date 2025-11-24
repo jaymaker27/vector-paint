@@ -60,6 +60,121 @@ try:
 except Exception as e:  # pragma: no cover (on non-Pi dev)
     GPIO = None
     print("[turret] WARNING: RPi.GPIO not available:", e)
+from pathlib import Path
+import json
+
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+# Soft travel limits (no upper limit switch → software limits)
+# ------------------------------------------------------------
+
+SOFT_LIMITS_FILE = Path.home() / ".vpp_soft_limits.json"
+TRACK_INVERT_FILE = Path.home() / ".vpp_tracking_inversion.json"
+
+# Default: we know min is home (0), max is unknown until calibrated.
+# These are in MOTOR STEPS, relative to the homed position.
+SOFT_LIMITS = {
+    "x_min": 0,
+    "x_max": None,  # filled in by travel calibration
+    "y_min": 0,
+    "y_max": None,
+}
+
+# Debug view of our logical position in motor steps, relative to HOME.
+# We keep this in sync with the internal _POS_* counters that the rest
+# of the backend uses.
+CUR_X_STEPS = 0
+CUR_Y_STEPS = 0
+
+
+def _load_soft_limits():
+    """Load soft limits from disk (if present)."""
+    global SOFT_LIMITS
+    try:
+        data = json.loads(SOFT_LIMITS_FILE.read_text())
+        if isinstance(data, dict):
+            SOFT_LIMITS.update(data)
+        print(f"[turret] Soft limits loaded: {SOFT_LIMITS}")
+    except FileNotFoundError:
+        print("[turret] No soft limits file yet")
+    except Exception as e:
+        print(f"[turret] Failed to load soft limits: {e}")
+
+
+def _save_soft_limits():
+    """Persist soft limits to disk."""
+    try:
+        SOFT_LIMITS_FILE.write_text(json.dumps(SOFT_LIMITS))
+        print(f"[turret] Soft limits saved: {SOFT_LIMITS}")
+    except Exception as e:
+        print(f"[turret] Failed to save soft limits: {e}")
+def _load_tracking_inversion():
+    """Load tracking inversion preferences from disk (if present)."""
+    global TRACK_INVERT_X, TRACK_INVERT_Y
+    try:
+        data = json.loads(TRACK_INVERT_FILE.read_text())
+        if isinstance(data, dict):
+            ix = data.get("invert_x")
+            iy = data.get("invert_y")
+            if isinstance(ix, bool):
+                TRACK_INVERT_X = -1 if ix else 1
+            if isinstance(iy, bool):
+                TRACK_INVERT_Y = -1 if iy else 1
+        print(
+            "[turret] Tracking inversion loaded:",
+            {"TRACK_INVERT_X": TRACK_INVERT_X, "TRACK_INVERT_Y": TRACK_INVERT_Y},
+        )
+    except FileNotFoundError:
+        # No preferences yet; leave defaults
+        pass
+    except Exception as e:
+        print(f"[turret] Failed to load tracking inversion: {e}")
+
+
+def _save_tracking_inversion(invert_x: bool, invert_y: bool):
+    """Persist tracking inversion preferences to disk."""
+    payload = {"invert_x": bool(invert_x), "invert_y": bool(invert_y)}
+    try:
+        TRACK_INVERT_FILE.write_text(json.dumps(payload))
+        print("[turret] Tracking inversion saved:", payload)
+    except Exception as e:
+        print(f"[turret] Failed to save tracking inversion: {e}")
+
+
+def _set_current_position_steps(x_steps=None, y_steps=None):
+    """
+    Update our logical idea of where the turret is (in steps).
+
+    This keeps CUR_* and the internal _POS_* counters in sync so that
+    soft limits and UI debug both see the same position.
+    """
+    global CUR_X_STEPS, CUR_Y_STEPS, _POS_X_STEPS, _POS_Y_STEPS
+    if x_steps is not None:
+        CUR_X_STEPS = int(x_steps)
+    if y_steps is not None:
+        CUR_Y_STEPS = int(y_steps)
+
+    # Mirror into the main position counters under the state lock.
+    # _STATE_LOCK and _POS_* are defined later in the file; by the
+    # time this is actually CALLED (e.g. from home_all), they exist.
+    try:
+        with _STATE_LOCK:
+            if x_steps is not None:
+                _POS_X_STEPS = CUR_X_STEPS
+            if y_steps is not None:
+                _POS_Y_STEPS = CUR_Y_STEPS
+    except NameError:
+        # If someone calls this very early during import before those
+        # globals exist, just skip syncing; they'll be set later anyway.
+        pass
+
+    print(f"[turret] Position now X={CUR_X_STEPS}, Y={CUR_Y_STEPS}")
+
+
+# Load soft limits once at import so jog_xy can enforce them.
+_load_soft_limits()
+# Load tracking inversion preferences (if any) so Predator mode starts with them
+_load_tracking_inversion()
 
 # ---------------- GPIO PINS (BCM) ----------------
 
@@ -82,7 +197,7 @@ HOMING_STEP_DELAY  = 0.0010   # slightly slower for homing
 MAX_HOMING_STEPS   = 20000    # safety bound
 
 # Jogging: base steps for a "unit" nudge.
-DEFAULT_JOG_STEPS  = 400       # larger so jogs are visible
+DEFAULT_JOG_STEPS  = 800       # larger so jogs are visible
 JOG_STEPS_PER_DEG  = 200       # rough mapping, tune later
 
 FIRE_PULSE_SEC     = 0.150    # marker/relay pulse duration
@@ -528,26 +643,137 @@ def home_all():
     _home_single_axis("Y", STEP_Y_PIN, DIR_Y_PIN, LIM_Y_PIN)
 
     print("[turret] Home all complete")
+    # After homing, define this as position 0,0
+    _set_current_position_steps(0, 0)
 
+# ---------------- JOGGING / SOFT TRAVEL LIMITS ----------------
 
 @_safe
 def calibrate_all():
-    """Wrapper used by UI 'Calibrate' button."""
+    """
+    Wrapper used by UI 'Calibrate' button.
+
+    - Homes both axes (home_all).
+    - Resets our logical position to 0,0 in both the CUR_* and
+      internal _POS_* counters.
+    - Does NOT change any existing soft-limit maxima; use the
+      travel calibration dialog for that.
+    """
     print("[turret] Calibrate requested")
     home_all()
+    _set_current_position_steps(0, 0)
 
-
-# ---------------- JOGGING ----------------
 
 @_safe
-def jog_xy(x_steps: int, y_steps: int, speed_scale: float = 1.0):
+def begin_travel_calibration():
     """
-    Jog the turret by a certain number of steps on X and Y.
+    Step 1 of 'Rotation / Travel Calibration'.
 
-    Positive steps = DIR_PIN HIGH
-    Negative steps = DIR_PIN LOW
+    Called when the user presses 'Home & Unlock Travel' in the UI.
+    """
+    global SOFT_LIMITS
+
+    print("[turret] begin_travel_calibration: homing + clear soft maxima")
+    home_all()
+    _set_current_position_steps(0, 0)
+
+    # Home is always 0,0
+    SOFT_LIMITS["x_min"] = 0
+    SOFT_LIMITS["y_min"] = 0
+    # Clear max so the user can jog out to new bounds
+    SOFT_LIMITS["x_max"] = None
+    SOFT_LIMITS["y_max"] = None
+    _save_soft_limits()
+
+
+@_safe
+def finalize_travel_calibration():
+    """
+    Step 2 of 'Rotation / Travel Calibration'.
+
+    Whatever step-based position the turret is currently at becomes
+    the software max for each axis.
+    """
+    global SOFT_LIMITS
+
+    with _STATE_LOCK:
+        cur_x = _POS_X_STEPS
+        cur_y = _POS_Y_STEPS
+
+    x_min = SOFT_LIMITS.get("x_min", 0) or 0
+    y_min = SOFT_LIMITS.get("y_min", 0) or 0
+
+    SOFT_LIMITS["x_max"] = max(x_min, cur_x)
+    SOFT_LIMITS["y_max"] = max(y_min, cur_y)
+
+    _save_soft_limits()
+    print(
+        "[turret] finalize_travel_calibration: "
+        f"x range = [{SOFT_LIMITS['x_min']}, {SOFT_LIMITS['x_max']}], "
+        f"y range = [{SOFT_LIMITS['y_min']}, {SOFT_LIMITS['y_max']}]"
+    )
+
+
+def _apply_soft_limits_to_delta(x_steps: int, y_steps: int) -> Tuple[int, int]:
+    """
+    Clamp a requested delta (x_steps, y_steps) so that the RESULTING
+    absolute position stays within SOFT_LIMITS.
+
+    Returns (clamped_x_steps, clamped_y_steps).
+    """
+    global SOFT_LIMITS
+
+    with _STATE_LOCK:
+        cur_x = _POS_X_STEPS
+        cur_y = _POS_Y_STEPS
+
+    x_min = SOFT_LIMITS.get("x_min")
+    x_max = SOFT_LIMITS.get("x_max")
+    y_min = SOFT_LIMITS.get("y_min")
+    y_max = SOFT_LIMITS.get("y_max")
+
+    target_x = cur_x + int(x_steps)
+    target_y = cur_y + int(y_steps)
+
+    # Clamp X
+    if x_min is not None and target_x < x_min:
+        target_x = x_min
+    if x_max is not None and target_x > x_max:
+        target_x = x_max
+
+    # Clamp Y
+    if y_min is not None and target_y < y_min:
+        target_y = y_min
+    if y_max is not None and target_y > y_max:
+        target_y = y_max
+
+    clamped_x = target_x - cur_x
+    clamped_y = target_y - cur_y
+    return clamped_x, clamped_y
+
+
+@_safe
+def jog_xy(
+    x_steps: int,
+    y_steps: int,
+    speed_scale: float = 1.0,
+    bypass_limits: bool = False,
+):
+    """
+    Jog the turret by a certain number of STEPS on X and Y.
+
+      Positive steps = DIR_PIN HIGH
+      Negative steps = DIR_PIN LOW
 
     speed_scale multiplies BASE_STEP_DELAY (higher = slower).
+
+    If bypass_limits is False (normal jogs):
+      - The requested (x_steps, y_steps) is clamped so the final
+        position stays within SOFT_LIMITS (if x_max/y_max are set).
+
+    If bypass_limits is True (used for Predator tracking only):
+      - We still respect E-STOP and the physical limit switches,
+        but we skip the soft-limit clamping.
     """
     if not _ensure_gpio():
         print("[turret] jog_xy aborted: GPIO not ready")
@@ -562,25 +788,54 @@ def jog_xy(x_steps: int, y_steps: int, speed_scale: float = 1.0):
         print("[turret] jog_xy aborted: limit switch tripped", limits)
         return
 
-    delay_x = BASE_STEP_DELAY * max(0.1, min(speed_scale * _MOTION_PROFILE["x_speed_scale"], 10.0))
-    delay_y = BASE_STEP_DELAY * max(0.1, min(speed_scale * _MOTION_PROFILE["y_speed_scale"], 10.0))
+    # Respect the current motion profile (speed scaling)
+    delay_x = BASE_STEP_DELAY * max(
+        0.1, min(speed_scale * _MOTION_PROFILE["x_speed_scale"], 10.0)
+    )
+    delay_y = BASE_STEP_DELAY * max(
+        0.1, min(speed_scale * _MOTION_PROFILE["y_speed_scale"], 10.0)
+    )
 
-    print(f"[turret] jog_xy: X={x_steps}, Y={y_steps}, "
-          f"delay_x={delay_x:.6f}, delay_y={delay_y:.6f}")
+    orig_x, orig_y = int(x_steps), int(y_steps)
 
-    if x_steps != 0:
-        _move_axis_with_pos("X", STEP_X_PIN, DIR_X_PIN, x_steps, delay_x)
-    if y_steps != 0:
-        _move_axis_with_pos("Y", STEP_Y_PIN, DIR_Y_PIN, y_steps, delay_y)
+    if bypass_limits:
+        x_move, y_move = orig_x, orig_y
+    else:
+        x_move, y_move = _apply_soft_limits_to_delta(orig_x, orig_y)
+        if (x_move == 0 and y_move == 0) and (orig_x != 0 or orig_y != 0):
+            print(
+                "[turret] jog_xy: requested move "
+                f"(X={orig_x}, Y={orig_y}) would exceed soft limits → ignored"
+            )
+            return
+
+    print(
+        "[turret] jog_xy: "
+        f"requested X={orig_x}, Y={orig_y} → "
+        f"move X={x_move}, Y={y_move}, "
+        f"delay_x={delay_x:.6f}, delay_y={delay_y:.6f}, "
+        f"bypass_limits={bypass_limits}"
+    )
+
+    if x_move != 0:
+        _move_axis_with_pos("X", STEP_X_PIN, DIR_X_PIN, x_move, delay_x)
+    if y_move != 0:
+        _move_axis_with_pos("Y", STEP_Y_PIN, DIR_Y_PIN, y_move, delay_y)
+
+    # Keep CUR_* in sync for debug
+    with _STATE_LOCK:
+        global CUR_X_STEPS, CUR_Y_STEPS
+        CUR_X_STEPS = _POS_X_STEPS
+        CUR_Y_STEPS = _POS_Y_STEPS
 
 
 @_safe
 def jog(axis: str, direction: int, step_deg: float, speed: float):
     """
-    UI hook for manual jog buttons (Settings dialog).
+    UI hook for manual jog buttons (Settings / Calibration dialogs).
 
-    We map degrees -> steps using JOG_STEPS_PER_DEG,
-    enforce a minimum of DEFAULT_JOG_STEPS, and send to jog_xy().
+    We map degrees -> steps using JOG_STEPS_PER_DEG, enforce a minimum
+    of DEFAULT_JOG_STEPS, and send to jog_xy() (with soft limits).
     """
     axis = (axis or "").upper()
     direction = 1 if direction >= 0 else -1
@@ -612,11 +867,14 @@ def jog(axis: str, direction: int, step_deg: float, speed: float):
     base_speed = 1200.0
     speed_scale = base_speed / max(1.0, speed)
 
-    print(f"[turret] jog: axis={axis}, dir={direction}, "
-          f"steps=({x_steps},{y_steps}), step_deg={step_deg}, "
-          f"speed={speed}, scale={speed_scale:.3f}")
+    print(
+        f"[turret] jog: axis={axis}, dir={direction}, "
+        f"steps=({x_steps},{y_steps}), step_deg={step_deg}, "
+        f"speed={speed}, scale={speed_scale:.3f}"
+    )
 
-    jog_xy(x_steps, y_steps, speed_scale=speed_scale)
+    # Normal jogs always respect soft limits
+    jog_xy(x_steps, y_steps, speed_scale=speed_scale, bypass_limits=False)
 
 
 # ---------------- MOTION PROFILE ----------------
@@ -654,9 +912,15 @@ def set_motor_speeds(x_speed: float, y_speed: float):
     y_scale = base_speed / y_speed
 
     set_motion_profile(x_speed_scale=x_scale, y_speed_scale=y_scale)
-    print("[turret] set_motor_speeds:",
-          {"x_speed": x_speed, "y_speed": y_speed,
-           "x_scale": x_scale, "y_scale": y_scale})
+    print(
+        "[turret] set_motor_speeds:",
+        {
+            "x_speed": x_speed,
+            "y_speed": y_speed,
+            "x_scale": x_scale,
+            "y_scale": y_scale,
+        },
+    )
 
 
 # ---------------- FIRE CONTROL ----------------
@@ -961,6 +1225,15 @@ def run_paint_pass(job: dict, pass_index: int = 0):
         end_paint_session()
 
 # ---------------- TRACKING / SENTRY FLAGS ----------------
+# Tunable parameters for Predator tracking
+TRACK_DEADZONE = 0.05     # 5% of frame; reduces jitter
+TRACK_GAIN_X   = 150.0    # gentler tracking
+TRACK_GAIN_Y   = 150.0
+TRACK_MIN_STEP = 5        # ignore small jitter
+
+# If X or Y moves the wrong way on your hardware, set that axis to -1
+TRACK_INVERT_X = 1        # set to -1 to flip left/right
+TRACK_INVERT_Y = 1        # set to -1 to flip up/down
 
 @_safe
 def set_tracking_enabled(enabled: bool):
@@ -974,17 +1247,52 @@ def set_autofire_enabled(enabled: bool):
     global _AUTOFIRE_ENABLED
     _AUTOFIRE_ENABLED = bool(enabled)
     print("[turret] Autofire enabled:", _AUTOFIRE_ENABLED)
-
-
 @_safe
 def set_sentry_mode(enabled: bool):
     """
-    Enable/disable "Predator Sentry Mode".
+    UI hook: enable/disable Predator sentry mode.
+
+    This just flips the internal _SENTRY_ENABLED flag so:
+      - get_status() can report it to the UI
+      - other backend logic can optionally gate behavior on it
     """
     global _SENTRY_ENABLED
     _SENTRY_ENABLED = bool(enabled)
-    print("[turret] Sentry mode:", _SENTRY_ENABLED)
+    print("[turret] Sentry mode enabled:", _SENTRY_ENABLED)
 
+
+@_safe
+def set_tracking_inversion(invert_x: bool = None, invert_y: bool = None):
+    """
+    UI hook: flip left/right or up/down tracking direction.
+
+    invert_x / invert_y are booleans:
+      True  -> axis is inverted (multiplier = -1)
+      False -> normal (multiplier = +1)
+      None  -> leave axis unchanged
+    """
+    global TRACK_INVERT_X, TRACK_INVERT_Y
+
+    if invert_x is not None:
+        TRACK_INVERT_X = -1 if invert_x else 1
+    if invert_y is not None:
+        TRACK_INVERT_Y = -1 if invert_y else 1
+
+    # Persist to disk so UI choices survive reboot
+    _save_tracking_inversion(
+        invert_x=(TRACK_INVERT_X < 0),
+        invert_y=(TRACK_INVERT_Y < 0),
+    )
+
+    print(
+        "[turret] set_tracking_inversion:",
+        {
+            "invert_x": invert_x,
+            "invert_y": invert_y,
+            "TRACK_INVERT_X": TRACK_INVERT_X,
+            "TRACK_INVERT_Y": TRACK_INVERT_Y,
+        },
+    )
 
 @_safe
 def sentry_scan_step(direction: int):
@@ -1004,23 +1312,64 @@ def sentry_fire_at(x_norm: float, y_norm: float):
     """
     Called by UI predator mode when it has a target at (x_norm, y_norm) in [0..1].
 
-    We only fire if:
-      - tracking is enabled AND
-      - autofire is enabled AND
-      - E-STOP is not pressed and GPIO is ready.
+    Behaviour:
+      - Uses the target to nudge the turret toward the center crosshair
+        if tracking is enabled.
+      - Only fires when AUTOFIRE_ENABLED is True.
     """
     global _TRACKING_ENABLED, _AUTOFIRE_ENABLED
 
-    print(f"[turret] sentry_fire_at: target at ({x_norm:.3f}, {y_norm:.3f})")
-
-    if not _TRACKING_ENABLED:
-        print("[turret] sentry_fire_at: tracking disabled → not firing")
+    # Clamp and normalize inputs
+    try:
+        xn = max(0.0, min(1.0, float(x_norm)))
+        yn = max(0.0, min(1.0, float(y_norm)))
+    except Exception:
+        print(f"[turret] sentry_fire_at: invalid coords ({x_norm!r}, {y_norm!r})")
         return
 
+    print(f"[turret] sentry_fire_at: target at ({xn:.3f}, {yn:.3f})")
+
+    # 1) If tracking is disabled, ignore target completely.
+    if not _TRACKING_ENABLED:
+        print("[turret] sentry_fire_at: tracking disabled → ignoring target")
+        return
+
+    # 2) Compute normalized error from center of the image
+    cx, cy = 0.5, 0.5
+    dx = xn - cx   # >0 → target is to the RIGHT of center
+    dy = yn - cy   # >0 → target is BELOW center (in image coords)
+
+    step_x = 0
+    step_y = 0
+
+    # Use global tunables defined near the tracking flags
+    if abs(dx) > TRACK_DEADZONE:
+        # TRACK_INVERT_* lets you flip an axis if geometry is reversed
+        step_x = int(round(dx * TRACK_GAIN_X * TRACK_INVERT_X))
+
+    if abs(dy) > TRACK_DEADZONE:
+        # dy > 0 means target is below center in image; invert once for turret Y
+        step_y = int(round(-dy * TRACK_GAIN_Y * TRACK_INVERT_Y))
+
+    # Filter out tiny twitches
+    if abs(step_x) < TRACK_MIN_STEP:
+        step_x = 0
+    if abs(step_y) < TRACK_MIN_STEP:
+        step_y = 0
+
+    # 3) Apply a small tracking jog toward the target
+    if step_x != 0 or step_y != 0:
+        print(f"[turret] sentry_fire_at: tracking jog X={step_x}, Y={step_y}")
+        # Here we bypass SOFT_LIMITS, but still honour E-STOP and
+        # Respect SOFT_LIMITS while tracking toward the target.
+        jog_xy(step_x, step_y, speed_scale=1.2, bypass_limits=False)
+
+    # 4) Firing is gated by AUTOFIRE_ENABLED
     if not _AUTOFIRE_ENABLED:
         print("[turret] sentry_fire_at: autofire disabled → not firing")
         return
 
+    # Extra sanity before firing: respect E-STOP / GPIO
     if not _ensure_gpio():
         print("[turret] sentry_fire_at: GPIO not ready → not firing")
         return
@@ -1028,7 +1377,7 @@ def sentry_fire_at(x_norm: float, y_norm: float):
         print("[turret] sentry_fire_at: E-STOP pressed → not firing")
         return
 
-    print("[turret] sentry_fire_at: tracking+autofire enabled → firing")
+    print("[turret] sentry_fire_at: AUTOFIRE_ENABLED & tracking → firing")
     manual_fire()
 
 
